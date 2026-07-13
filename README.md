@@ -245,6 +245,28 @@ The summary includes:
 - total instrumented time
 - total process wall/CPU time
 
+## Scripts
+
+The scripts are intentionally thin wrappers behind Make targets:
+
+```text
+build_yolo_myaccel_local.sh      local MyAccel compile + driver link
+fetch_ubuntu_aarch64_sysroot.sh  Ubuntu 22.04 arm64 sysroot download
+cross_compile_aarch64_llvm.sh    macOS -> Linux/aarch64 cross compile
+package_aarch64_artifacts.sh     board tarball assembly
+run_yolo_aarch64_docker.sh       optional Ubuntu 22.04 arm64 runtime smoke test
+profile_yolo_ops.sh              local ONNX op profiling
+```
+
+Python helpers:
+
+```text
+fp16_to_fp32.py                  ONNX model conversion used by Makefile
+preprocess_yolo.py               image -> raw YOLO input tensor
+postprocess_yolo.py              raw YOLO output tensor -> detections
+summarize_onnxmlir_profile.py    parser used by profile_yolo_ops.sh
+```
+
 ## Useful targets
 
 ```sh
