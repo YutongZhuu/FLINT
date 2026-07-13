@@ -1,132 +1,129 @@
 # YOLOv5n with ONNX-MLIR and a custom Conv accelerator
 
-This repo demonstrates the workflow we care about:
+This project demonstrates one focused workflow:
 
-1. Compile a YOLOv5n ONNX model with ONNX-MLIR.
-2. Lower supported `onnx.Conv` operations to custom external C calls.
-3. Run the result locally.
-4. Cross-compile Linux/aarch64 artifacts for an Ubuntu 22.04 / GCC 12 board,
-   such as a Kria.
+1. Build ONNX-MLIR with a custom accelerator named `MyAccel`.
+2. Compile YOLOv5n so supported `onnx.Conv` ops lower to external C calls.
+3. Run the compiled model on the local machine.
+4. Cross-compile the same model/driver for Ubuntu 22.04 / GCC 12 arm64 boards
+   such as Kria.
 
-The custom accelerator is named `MyAccel`. Its runtime Conv implementation is:
+The custom Conv runtime lives in the ONNX-MLIR submodule:
 
 ```text
 third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime/MyConv.c
 ```
 
-The compiled model is emitted as a shared library. The YOLO weights are embedded
-inside that model library; the small driver only prepares tensors and calls the
-ONNX-MLIR entry point.
+The model weights are embedded into the compiled model shared library. The
+driver is intentionally small: it creates ONNX-MLIR runtime tensors, calls
+`run_main_graph`, and optionally dumps the raw output tensor.
+
+## Repository shape
 
 ```text
-build/yolo-myaccel-driver-aarch64     # executable driver
-build/yolov5n-myaccel-aarch64.so      # compiled graph + embedded weights
+driver/                         C/C++ test drivers
+scripts/                        setup, compile, package, profiling helpers
+samples/bus.jpg                 small open-source inference sample
+third_party/onnx-mlir           submodule: fork with MyAccel
+Dockerfile.yolo-aarch64-run     optional Ubuntu 22.04 arm64 runtime smoke test
 ```
+
+There is no LLVM fork. LLVM is a pinned build dependency of ONNX-MLIR; the
+project only forks ONNX-MLIR because that is where `MyAccel` lives.
 
 ## Requirements
 
-Common tools:
+Common:
 
 - Python 3
 - `curl`
 - `make`
 - LLVM/Clang with `lld`
-- Docker, only for the optional container-based local runners
+- a native `onnx-mlir` binary built with `MyAccel`
 
-For cross-compiling to Ubuntu 22.04 arm64 from macOS, you also need:
+Optional:
 
-- a macOS-native `onnx-mlir` binary with `MyAccel` enabled
-- a Linux/aarch64 Ubuntu 22.04 sysroot
+- Docker, only for running the Linux/aarch64 artifacts locally in an Ubuntu
+  22.04 arm64 container.
 
-The repo automates model download, sysroot download, cross-compilation, and
-packaging. It does not rebuild the macOS-native ONNX-MLIR compiler by default;
-that build is expensive and environment-specific. Provide an existing
-`onnx-mlir` with `MyAccel`, or use the local build if present.
-
-If you cloned this repo fresh, initialize the pinned ONNX-MLIR submodule:
+Initialize the ONNX-MLIR submodule:
 
 ```sh
 git submodule update --init --recursive
 ```
 
-The Makefile defaults to the local compiler path we have been using:
+The Makefile defaults to:
 
 ```text
 third_party/onnx-mlir/build-host-exact/Release/bin/onnx-mlir
 ```
 
-Override it if your compiler lives elsewhere:
+Override it when needed:
 
 ```sh
 make ONNX_MLIR_BIN=/path/to/onnx-mlir ...
 ```
 
-## Fetch and prepare the YOLO model
+## Prepare the YOLO model
 
 Download YOLOv5n and convert FP16 initializers to FP32:
 
 ```sh
-make model
 make build/yolov5n-fp32.onnx
 ```
 
-The input shape is fixed:
+The model input is:
 
 ```text
 1 x 3 x 640 x 640 float32, NCHW, normalized to [0, 1]
 ```
 
-## Build and run the normal CPU model
+The helper:
 
-This path uses the official ONNX-MLIR container and is useful as a baseline:
+```text
+scripts/preprocess_yolo.py
+```
+
+turns an image into that raw tensor format.
+
+## Build locally with MyAccel
+
+Compile YOLOv5n with MyAccel and build the local driver:
 
 ```sh
-make all
-make run
+make local-myaccel
 ```
 
 Artifacts:
 
 ```text
-build/yolov5n.so
-build/yolo_driver
+build/yolov5n-myaccel.so
+build/yolo-myaccel-driver
+build/yolov5n-myaccel.ll
 ```
 
-## Build and run with MyAccel locally
-
-Run YOLOv5n with supported Conv ops lowered to custom C calls:
+Run on the sample tensor:
 
 ```sh
-make run-yolo-accelerator
+make run-local-myaccel
 ```
 
-Expected evidence that the custom path is active:
+Verify that Conv was lowered to the custom call path:
+
+```sh
+make verify-local-myaccel
+```
+
+You should see references to `my_conv_f32` in the generated LLVM IR and runtime
+messages like:
 
 ```text
 MYACCEL: my_conv_f32 invoked
 ```
 
-The local MyAccel artifacts are:
+## Cross-compile for Ubuntu 22.04 arm64
 
-```text
-build/yolov5n-myaccel.so
-build/yolo-myaccel-driver
-```
-
-There is also a small Conv-only test:
-
-```sh
-make verify-accelerator
-```
-
-That test checks the generated IR for an external Conv call and compares the C
-runtime output against expected values.
-
-## Cross-compile for Ubuntu 22.04 / GCC 12 arm64
-
-This is the recommended board path.
-
-First fetch a Jammy arm64 sysroot:
+Fetch a Jammy arm64 sysroot:
 
 ```sh
 make sysroot-jammy
@@ -138,28 +135,10 @@ This creates:
 build/aarch64-linux-jammy-sysroot
 ```
 
-It intentionally uses Ubuntu 22.04 packages. This matters because Kria images
-often provide `libstdc++.so.6` up to:
-
-```text
-GLIBCXX_3.4.30
-```
-
-Building against Ubuntu 24.04 / newer GCC can accidentally require symbols such
-as `GLIBCXX_3.4.32`, which will not load on the board.
-
-Then cross-compile:
+Then build Linux/aarch64 artifacts:
 
 ```sh
 make cross-yolo-accelerator-aarch64
-```
-
-Equivalent explicit form:
-
-```sh
-AARCH64_SYSROOT=build/aarch64-linux-jammy-sysroot \
-ONNX_MLIR_BIN=third_party/onnx-mlir/build-host-exact/Release/bin/onnx-mlir \
-./scripts/cross_compile_aarch64_llvm.sh
 ```
 
 Artifacts:
@@ -169,37 +148,38 @@ build/yolo-myaccel-driver-aarch64
 build/yolov5n-myaccel-aarch64.so
 ```
 
-Check the required C++ runtime versions:
+The sysroot intentionally uses Ubuntu 22.04 / GCC 12 packages. This avoids
+requiring newer C++ runtime symbols such as `GLIBCXX_3.4.32` on boards whose
+`libstdc++.so.6` only goes up to `GLIBCXX_3.4.30`.
+
+Check the resulting dependency versions:
 
 ```sh
 llvm-readelf --version-info build/yolo-myaccel-driver-aarch64 | grep GLIBCXX
 ```
 
-With the Jammy sysroot, the driver should not require newer symbols than the
-board provides.
+## Package for the board
 
-## Package files for the board
-
-Create a tarball containing the driver, model library, sample input, and helper
-scripts:
+Create a tarball with the arm64 driver, compiled model, sample input, and
+minimal helper scripts:
 
 ```sh
 make package-aarch64
 ```
 
-This creates:
+Result:
 
 ```text
 build/kria-yolo-myaccel.tar.gz
 ```
 
-Copy it to the board:
+Copy to the board:
 
 ```sh
 scp build/kria-yolo-myaccel.tar.gz ubuntu@kria:~/dev/
 ```
 
-On the board:
+Run on the board:
 
 ```sh
 cd ~/dev
@@ -220,39 +200,33 @@ LD_LIBRARY_PATH="$PWD/build:$HOME/dev/runtime-libs" \
   build/bus-myaccel-aarch64.bin
 ```
 
-If loading fails, inspect the dynamic dependencies:
+Debug dynamic loading with:
 
 ```sh
 ldd ./build/yolo-myaccel-driver-aarch64
 strings /usr/lib/aarch64-linux-gnu/libstdc++.so.6 | grep GLIBCXX_3.4 | tail
 ```
 
-## Run the arm64 build locally with Docker
+## Optional: run the arm64 artifacts locally with Docker
 
-On an Apple Silicon Mac, you can sanity-check the Linux/aarch64 build in an
-Ubuntu 22.04 arm64 container:
+Docker is not used to compile the project. It is only a convenience for testing
+the Linux/aarch64 output on a Mac before copying it to the board.
 
 ```sh
 make run-aarch64-docker
 ```
 
-Or directly:
+This uses:
 
-```sh
-./scripts/run_yolo_aarch64_docker.sh
+```text
+Dockerfile.yolo-aarch64-run
 ```
 
-This runs:
+and runs:
 
 1. image preprocessing
 2. the Linux/aarch64 driver
 3. YOLO postprocessing
-
-The default sample is:
-
-```text
-samples/bus.jpg
-```
 
 ## Profiling
 
@@ -271,30 +245,27 @@ The summary includes:
 - total instrumented time
 - total process wall/CPU time
 
-The C++ driver calls `omInstrumentPrint()` when the instrumented runtime is
-present, so ONNX-MLIR timing reports are flushed automatically.
+## Useful targets
 
-## Useful scripts
-
-```text
-scripts/fetch_ubuntu_aarch64_sysroot.sh   # download Ubuntu 22.04 arm64 sysroot
-scripts/cross_compile_aarch64_llvm.sh     # cross-compile model + runtime + driver
-scripts/package_aarch64_artifacts.sh      # package board artifacts
-scripts/run_yolo_aarch64_docker.sh        # run arm64 artifacts in Docker
-scripts/preprocess_yolo.py                # image -> raw input tensor
-scripts/postprocess_yolo.py               # raw output tensor -> detections
-scripts/profile_yolo_ops.sh               # ONNX-MLIR op timing summary
+```sh
+make build/yolov5n-fp32.onnx
+make local-myaccel
+make run-local-myaccel
+make verify-local-myaccel
+make sysroot-jammy
+make cross-yolo-accelerator-aarch64
+make package-aarch64
+make run-aarch64-docker
+make clean
 ```
 
 ## Clean
-
-Remove generated outputs:
 
 ```sh
 make clean
 ```
 
-Also remove local ONNX-MLIR build directories:
+Remove local ONNX-MLIR build directories too:
 
 ```sh
 make distclean
