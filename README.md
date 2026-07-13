@@ -43,12 +43,10 @@ packaging. It does not rebuild the macOS-native ONNX-MLIR compiler by default;
 that build is expensive and environment-specific. Provide an existing
 `onnx-mlir` with `MyAccel`, or use the local build if present.
 
-If you cloned this repo fresh, initialize ONNX-MLIR and apply the local MyAccel
-patch first:
+If you cloned this repo fresh, initialize the pinned ONNX-MLIR submodule:
 
 ```sh
 git submodule update --init --recursive
-./scripts/apply_onnx_mlir_myaccel_patch.sh
 ```
 
 The Makefile defaults to the local compiler path we have been using:

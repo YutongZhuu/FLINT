@@ -1,4 +1,4 @@
 [submodule "third_party/onnx-mlir"]
 	path = third_party/onnx-mlir
-	url = https://github.com/onnx/onnx-mlir.git
-	ignore = dirty
+	url = https://github.com/YutongZhuu/onnx-mlir.git
+	branch = myaccel-yolo-conv
