@@ -1,0 +1,32 @@
+FROM --platform=linux/amd64 ghcr.io/onnxmlir/onnx-mlir:latest
+
+USER root
+RUN dnf install -y cmake ninja-build gcc-c++ python3-devel git && dnf clean all
+RUN git clone --filter=blob:none --no-checkout https://github.com/llvm/llvm-project.git /workdir/llvm-project && \
+    cd /workdir/llvm-project && \
+    git sparse-checkout init --cone && \
+    git sparse-checkout set llvm/include llvm/cmake mlir/include mlir/cmake third-party/unittest && \
+    git checkout 1053047a4be7d1fece3adaf5e7597f838058c947 && \
+    mkdir -p /workdir/llvm-project/build/lib/cmake /workdir/llvm-project/build/include && \
+    ln -s /usr/local/lib/cmake/llvm /workdir/llvm-project/build/lib/cmake/llvm && \
+    ln -s /usr/local/lib/cmake/mlir /workdir/llvm-project/build/lib/cmake/mlir && \
+    cp -a /usr/local/include/. /workdir/llvm-project/build/include/
+RUN cd /workdir/llvm-project && git sparse-checkout disable && \
+    cmake -S llvm -B tool-build -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_PROJECTS=mlir \
+      -DLLVM_TARGETS_TO_BUILD=X86 -DLLVM_ENABLE_TERMINFO=OFF \
+      -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF && \
+    cmake --build tool-build --target llvm-tblgen mlir-tblgen mlir-headers -j8 && \
+    sed -i 's/#define LLVM_ENABLE_ABI_BREAKING_CHECKS 0/#define LLVM_ENABLE_ABI_BREAKING_CHECKS 1/' \
+      tool-build/include/llvm/Config/abi-breaking.h && \
+    mkdir -p /workdir/llvm-project/build/bin && \
+    cp tool-build/bin/llvm-tblgen tool-build/bin/mlir-tblgen \
+      /workdir/llvm-project/build/bin/ && \
+    cp -a tool-build/include/. /workdir/llvm-project/build/include/ && \
+    mkdir -p /workdir/llvm-project/build/tools/mlir/include && \
+    cp -a tool-build/tools/mlir/include/. /workdir/llvm-project/build/tools/mlir/include/ && \
+    cp tool-build/lib/lib*TableGen*.a tool-build/lib/lib*Tblgen*.a \
+      /workdir/llvm-project/build/lib/ && \
+    cp -as /usr/local/lib/lib*.so* /workdir/llvm-project/build/lib/
+
+ENTRYPOINT ["/bin/bash", "-lc"]

@@ -1,0 +1,13 @@
+build/
+models/
+.venv/
+.DS_Store
+
+*.a
+*.dylib
+*.o
+*.so
+*.tar.gz
+
+third_party/onnx-mlir/build*/
+build/llvm-project-onnxmlir/
