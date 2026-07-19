@@ -12,6 +12,7 @@ out_base=${AARCH64_OUT_BASE:-build/yolov5n-myaccel-aarch64}
 driver_out=${AARCH64_DRIVER_OUT:-build/yolo-myaccel-driver-aarch64}
 gcc_toolchain=${AARCH64_GCC_TOOLCHAIN:-$sysroot/usr}
 target_lib_dir=${AARCH64_TARGET_LIB_DIR:-$sysroot/usr/lib/aarch64-linux-gnu}
+myaccel_use_xrt=${MYACCEL_USE_XRT:-0}
 
 if [ -z "$sysroot" ]; then
   cat >&2 <<'EOF'
@@ -74,6 +75,61 @@ EOF
 fi
 rm -f /tmp/onnx-mlir-aarch64-probe
 
+xrt_compile_flags=()
+xrt_link_flags=()
+if [ "$myaccel_use_xrt" = "1" ]; then
+  xrt_root=${AARCH64_XRT_ROOT:-${XILINX_XRT:-}}
+  xrt_include_dir=${AARCH64_XRT_INCLUDE_DIR:-}
+  xrt_lib_dir=${AARCH64_XRT_LIB_DIR:-}
+
+  if [ -z "$xrt_include_dir" ] && [ -n "$xrt_root" ]; then
+    xrt_include_dir="$xrt_root/include"
+  fi
+  if [ -z "$xrt_lib_dir" ] && [ -n "$xrt_root" ]; then
+    xrt_lib_dir="$xrt_root/lib"
+  fi
+  if [ -z "$xrt_include_dir" ] && [ -d "$sysroot/usr/include/xrt" ]; then
+    xrt_include_dir="$sysroot/usr/include"
+  fi
+  if [ -z "$xrt_lib_dir" ]; then
+    for candidate in "$sysroot/usr/lib/aarch64-linux-gnu" "$sysroot/usr/lib"; do
+      if [ -e "$candidate/libxrt_coreutil.so" ] || [ -e "$candidate/libxrt_coreutil.a" ]; then
+        xrt_lib_dir=$candidate
+        break
+      fi
+    done
+  fi
+
+  if [ -z "$xrt_include_dir" ] || [ ! -f "$xrt_include_dir/xrt/xrt_bo.h" ]; then
+    cat >&2 <<EOF
+error: MYACCEL_USE_XRT=1 but XRT headers were not found.
+
+Set one of:
+
+  AARCH64_XRT_ROOT=/path/to/aarch64/xrt
+  AARCH64_XRT_INCLUDE_DIR=/path/to/include
+
+The include directory must contain xrt/xrt_bo.h.
+EOF
+    exit 2
+  fi
+
+  if [ -z "$xrt_lib_dir" ] || { [ ! -e "$xrt_lib_dir/libxrt_coreutil.so" ] && [ ! -e "$xrt_lib_dir/libxrt_coreutil.a" ]; }; then
+    cat >&2 <<EOF
+error: MYACCEL_USE_XRT=1 but libxrt_coreutil was not found.
+
+Set one of:
+
+  AARCH64_XRT_ROOT=/path/to/aarch64/xrt
+  AARCH64_XRT_LIB_DIR=/path/to/lib
+EOF
+    exit 2
+  fi
+
+  xrt_compile_flags=(-DMYACCEL_USE_XRT -I"$xrt_include_dir")
+  xrt_link_flags=(-L"$xrt_lib_dir" -lxrt_coreutil -pthread)
+fi
+
 mkdir -p build/aarch64
 
 "$onnx_mlir" \
@@ -111,15 +167,25 @@ for src in "${runtime_sources[@]}"; do
     -Ithird_party/onnx-mlir/include \
     -Ithird_party/onnx-mlir \
     -Ithird_party/onnx-mlir/src/Runtime \
+    -Ithird_party/onnx-mlir/src/Accelerators/MyAccel/Runtime \
     -c "$src" -o "$obj"
   runtime_objects+=("$obj")
 done
 
-"$clang" --target="$target" --sysroot="$sysroot" \
+myaccel_xrt_obj="build/aarch64/MyAccelXrt.o"
+"$clangxx" --target="$target" --sysroot="$sysroot" \
+  --gcc-toolchain="$gcc_toolchain" -B"$gcc_lib_dir" -B"$target_lib_dir" \
+  -std=c++17 -O3 -fPIC -Wno-unknown-pragmas \
+  -Ithird_party/onnx-mlir/src/Accelerators/MyAccel/Runtime \
+  "${xrt_compile_flags[@]}" \
+  -c third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime/MyAccelXrt.cpp -o "$myaccel_xrt_obj"
+runtime_objects+=("$myaccel_xrt_obj")
+
+"$clangxx" --target="$target" --sysroot="$sysroot" \
   --gcc-toolchain="$gcc_toolchain" -B"$gcc_lib_dir" -B"$target_lib_dir" \
   -shared -fPIC -fuse-ld=lld \
   "$out_base.o" "${runtime_objects[@]}" \
-  -lm \
+  -lm "${xrt_link_flags[@]}" \
   -o "$out_base.so"
 
 "$clangxx" --target="$target" --sysroot="$sysroot" \

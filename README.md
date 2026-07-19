@@ -45,6 +45,10 @@ Optional:
 
 - Docker, only for running the Linux/aarch64 artifacts locally in an Ubuntu
   22.04 arm64 container.
+- AMD Vitis on an x86_64 Linux machine, only for building the KV260 FPGA
+  `.xclbin`.
+- XRT runtime/development files on the KV260, only for running the FPGA-backed
+  MyAccel path.
 
 Initialize the ONNX-MLIR submodule:
 
@@ -148,6 +152,21 @@ build/yolo-myaccel-driver-aarch64
 build/yolov5n-myaccel-aarch64.so
 ```
 
+By default, `MyAccelXrt.cpp` builds a stub that returns failure, so
+`my_conv_f32` uses the CPU fallback implementation. To build the arm64 runtime
+with the real XRT wrapper, enable XRT and point the cross-compile script at
+target/aarch64 XRT headers and libraries:
+
+```sh
+export MYACCEL_USE_XRT=1
+export AARCH64_XRT_INCLUDE_DIR=/path/to/aarch64/include
+export AARCH64_XRT_LIB_DIR=/path/to/aarch64/lib
+make cross-yolo-accelerator-aarch64
+```
+
+The include directory must contain `xrt/xrt_bo.h`. The library directory must
+contain `libxrt_coreutil.so` or `libxrt_coreutil.a`.
+
 The sysroot intentionally uses Ubuntu 22.04 / GCC 12 packages. This avoids
 requiring newer C++ runtime symbols such as `GLIBCXX_3.4.32` on boards whose
 `libstdc++.so.6` only goes up to `GLIBCXX_3.4.30`.
@@ -205,6 +224,119 @@ Debug dynamic loading with:
 ```sh
 ldd ./build/yolo-myaccel-driver-aarch64
 strings /usr/lib/aarch64-linux-gnu/libstdc++.so.6 | grep GLIBCXX_3.4 | tail
+```
+
+## Build the KV260 Conv2D xclbin
+
+The KV260 is the runtime target, not the Vitis build machine. Build the FPGA
+binary on an x86_64 Linux machine with Vitis installed, then copy the resulting
+`.xclbin` to the board.
+
+The current HLS kernel source is:
+
+```text
+third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime/Conv2DKernel.cpp
+```
+
+The Vitis build has two steps:
+
+```text
+Conv2DKernel.cpp -> conv2d_kernel.hw.xo
+conv2d_kernel.hw.xo -> conv2d_kernel.hw.xclbin
+```
+
+It requires a KV260 Vitis platform `.xpfm`. If the platform is not already
+installed, one known 2022.1 flow is to build the Kria platform on the Vitis
+machine:
+
+```sh
+source /opt/Xilinx/Vitis/2022.1/settings64.sh
+
+mkdir -p ~/xilinx-platforms
+cd ~/xilinx-platforms
+git clone --branch xlnx_rel_v2022.1 --recursive https://github.com/Xilinx/kria-vitis-platforms.git
+cd kria-vitis-platforms/kv260
+make platform PFM=kv260_ispMipiRx_vcu_DP
+```
+
+If platform packaging fails with `Xvfb is not available`, either install
+`xvfb` on the Vitis machine or connect with a valid X display, for example
+SSH X forwarding from XQuartz on macOS. The useful output platform is the final
+`.xpfm` under:
+
+```text
+platforms/xilinx_kv260_ispMipiRx_vcu_DP_202210_1/
+```
+
+not the intermediate copy under `platforms/xsct/...`.
+
+Verify the platform:
+
+```sh
+export PLATFORM=$HOME/xilinx-platforms/kria-vitis-platforms/kv260/platforms/xilinx_kv260_ispMipiRx_vcu_DP_202210_1/kv260_ispMipiRx_vcu_DP.xpfm
+platforminfo "$PLATFORM"
+```
+
+Then build this project's kernel `.xclbin` from the repo root:
+
+```sh
+cd ~/capstone-compiler
+source /opt/Xilinx/Vitis/2022.1/settings64.sh
+export PLATFORM=$HOME/xilinx-platforms/kria-vitis-platforms/kv260/platforms/xilinx_kv260_ispMipiRx_vcu_DP_202210_1/kv260_ispMipiRx_vcu_DP.xpfm
+
+mkdir -p build/kv260-hls
+
+v++ -c \
+  -t hw \
+  --platform "$PLATFORM" \
+  -k conv2d_kernel \
+  -I third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime \
+  third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime/Conv2DKernel.cpp \
+  -o build/kv260-hls/conv2d_kernel.hw.xo
+
+v++ -l \
+  -t hw \
+  --platform "$PLATFORM" \
+  build/kv260-hls/conv2d_kernel.hw.xo \
+  -o build/kv260-hls/conv2d_kernel.hw.xclbin
+```
+
+Result:
+
+```text
+build/kv260-hls/conv2d_kernel.hw.xclbin
+```
+
+Copy it to the KV260:
+
+```sh
+scp build/kv260-hls/conv2d_kernel.hw.xclbin ubuntu@kria:~/dev/
+```
+
+## Run with XRT on KV260
+
+The ONNX-MLIR runtime still enters MyAccel through the external C call
+`my_conv_f32`. That function validates the ONNX tensor metadata, narrows the
+FPGA-supported parameters to 32-bit values, and calls the XRT wrapper. If the
+conv is unsupported or XRT fails, it falls back to the CPU reference
+convolution.
+
+On the KV260, set the xclbin path before running the compiled model:
+
+```sh
+export MYACCEL_XCLBIN=$HOME/dev/conv2d_kernel.hw.xclbin
+
+./build/yolo-myaccel-driver-aarch64 \
+  build/bus-input-aarch64.bin \
+  build/bus-myaccel-aarch64.bin
+```
+
+Use `MYACCEL_FORCE_CPU=1` to force the CPU fallback path:
+
+```sh
+MYACCEL_FORCE_CPU=1 ./build/yolo-myaccel-driver-aarch64 \
+  build/bus-input-aarch64.bin \
+  build/bus-myaccel-aarch64.bin
 ```
 
 ## Optional: run the arm64 artifacts locally with Docker
