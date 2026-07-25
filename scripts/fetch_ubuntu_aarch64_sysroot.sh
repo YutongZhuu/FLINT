@@ -17,6 +17,8 @@ packages=(
   libstdc++6
   libstdc++-12-dev
   linux-libc-dev
+  libuuid1
+  uuid-dev
 )
 
 mkdir -p "$deb_dir" "$sysroot"

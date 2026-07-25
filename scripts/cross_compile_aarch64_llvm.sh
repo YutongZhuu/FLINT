@@ -8,6 +8,7 @@ sysroot=${AARCH64_SYSROOT:-}
 onnx_mlir=${ONNX_MLIR_BIN:-onnx-mlir}
 clang=${CLANG:-clang}
 clangxx=${CLANGXX:-clang++}
+lld=${LLD:-}
 out_base=${AARCH64_OUT_BASE:-build/yolov5n-myaccel-aarch64}
 driver_out=${AARCH64_DRIVER_OUT:-build/yolo-myaccel-driver-aarch64}
 gcc_toolchain=${AARCH64_GCC_TOOLCHAIN:-$sysroot/usr}
@@ -43,6 +44,19 @@ else
   fi
 fi
 
+if [ -z "$lld" ]; then
+  if command -v ld.lld >/dev/null 2>&1; then
+    lld=$(command -v ld.lld)
+  elif [ -x /opt/homebrew/bin/ld.lld ]; then
+    lld=/opt/homebrew/bin/ld.lld
+  elif [ -x /usr/local/bin/ld.lld ]; then
+    lld=/usr/local/bin/ld.lld
+  else
+    lld=lld
+  fi
+fi
+linker_flag="-fuse-ld=$lld"
+
 if ! command -v "$onnx_mlir" >/dev/null 2>&1; then
   cat >&2 <<EOF
 error: cannot find ONNX_MLIR_BIN '$onnx_mlir'.
@@ -57,7 +71,7 @@ fi
 
 if ! printf 'int main(void) { return 0; }\n' | \
   "$clang" --target="$target" --sysroot="$sysroot" --gcc-toolchain="$gcc_toolchain" \
-    -B"$gcc_lib_dir" -B"$target_lib_dir" -fuse-ld=lld \
+    -B"$gcc_lib_dir" -B"$target_lib_dir" "$linker_flag" \
     -x c -Wl,--no-undefined -o /tmp/onnx-mlir-aarch64-probe - >/dev/null 2>&1; then
   cat >&2 <<EOF
 error: clang cannot link a trivial $target program with this sysroot.
@@ -66,6 +80,7 @@ Check that AARCH64_SYSROOT points at a complete Linux/aarch64 sysroot and that
 lld is available. Current values:
 
   CLANG=$clang
+  LLD=$lld
   AARCH64_TARGET=$target
   AARCH64_SYSROOT=$sysroot
   AARCH64_GCC_TOOLCHAIN=$gcc_toolchain
@@ -183,14 +198,14 @@ runtime_objects+=("$myaccel_xrt_obj")
 
 "$clangxx" --target="$target" --sysroot="$sysroot" \
   --gcc-toolchain="$gcc_toolchain" -B"$gcc_lib_dir" -B"$target_lib_dir" \
-  -shared -fPIC -fuse-ld=lld \
+  -shared -fPIC \
   "$out_base.o" "${runtime_objects[@]}" \
-  -lm "${xrt_link_flags[@]}" \
+  "$linker_flag" -lm "${xrt_link_flags[@]}" \
   -o "$out_base.so"
 
 "$clangxx" --target="$target" --sysroot="$sysroot" \
   --gcc-toolchain="$gcc_toolchain" -B"$gcc_lib_dir" -B"$target_lib_dir" \
-  -std=c++17 -O2 -fuse-ld=lld \
+  -std=c++17 -O2 "$linker_flag" \
   -Ithird_party/onnx-mlir/include \
   -Ithird_party/onnx-mlir \
   driver/yolo_driver.cpp "$out_base.so" \
