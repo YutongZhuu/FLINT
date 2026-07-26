@@ -3,12 +3,13 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-kernel_name=conv2d_kernel
-kernel_src=third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime/Conv2DKernel.cpp
 kernel_inc=third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime
-target=${TARGET:-hw}
-out_dir=${VITIS_OUT_DIR:-build/kv260-hls}
+conv1x1_src=$kernel_inc/Conv1x1Kernel.cpp
+conv3x3_src=$kernel_inc/Conv3x3Kernel.cpp
+target=${TARGET:-${VITIS_TARGET:-hw}}
+out_dir=${VITIS_OUT_DIR:-${KV260_HLS_OUTPUT_DIR:-build/kv260-hls}}
 platform=${PLATFORM:-${KV260_PLATFORM:-}}
+kernel_clock_hz=${KV260_KERNEL_CLOCK_HZ:-100000000}
 
 if [ -z "$platform" ]; then
   cat >&2 <<'EOF'
@@ -38,21 +39,32 @@ fi
 
 mkdir -p "$out_dir"
 
-xo="$out_dir/$kernel_name.$target.xo"
-xclbin="$out_dir/$kernel_name.$target.xclbin"
+conv1x1_xo="$out_dir/conv1x1_kernel.$target.xo"
+conv3x3_xo="$out_dir/conv3x3_kernel.$target.xo"
+xclbin="$out_dir/conv2d_kernel.$target.xclbin"
 
 v++ -c \
   -t "$target" \
   --platform "$platform" \
-  -k "$kernel_name" \
+  -k conv1x1_kernel \
   -I "$kernel_inc" \
-  "$kernel_src" \
-  -o "$xo"
+  "$conv1x1_src" \
+  -o "$conv1x1_xo"
+
+v++ -c \
+  -t "$target" \
+  --platform "$platform" \
+  -k conv3x3_kernel \
+  -I "$kernel_inc" \
+  "$conv3x3_src" \
+  -o "$conv3x3_xo"
 
 v++ -l \
   -t "$target" \
   --platform "$platform" \
-  "$xo" \
+  --clock.defaultFreqHz "$kernel_clock_hz" \
+  "$conv1x1_xo" \
+  "$conv3x3_xo" \
   -o "$xclbin"
 
 printf 'built %s\n' "$xclbin"
