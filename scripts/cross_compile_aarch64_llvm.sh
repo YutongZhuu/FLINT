@@ -16,6 +16,7 @@ gcc_toolchain=${AARCH64_GCC_TOOLCHAIN:-$sysroot/usr}
 target_lib_dir=${AARCH64_TARGET_LIB_DIR:-$sysroot/usr/lib/aarch64-linux-gnu}
 omp_lib_dir=${AARCH64_OMP_LIB_DIR:-$sysroot/usr/lib/llvm-14/lib}
 myaccel_use_xrt=${MYACCEL_USE_XRT:-0}
+disable_recompose=${ONNX_MLIR_DISABLE_RECOMPOSE:-0}
 
 if [ -z "$sysroot" ]; then
   cat >&2 <<'EOF'
@@ -135,8 +136,17 @@ fi
 
 mkdir -p build/aarch64
 
+onnx_mlir_graph_flags=()
+if [ "$disable_recompose" = "1" ]; then
+  # Preserve each QDQ-wrapped Conv for MyAccel. ONNX-MLIR's recompose pass
+  # otherwise combines eight pairs of parallel YOLO convolutions into eight
+  # new FP32 Conv operations, which no longer match the INT8 rewrite.
+  onnx_mlir_graph_flags+=(--disable-recompose)
+fi
+
 "$onnx_mlir" \
   --maccel=MyAccel \
+  "${onnx_mlir_graph_flags[@]}" \
   --mtriple="$target" \
   --mcpu=cortex-a53 \
   --parallel \
