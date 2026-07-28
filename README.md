@@ -456,17 +456,24 @@ The KV260 is the runtime target, not the Vitis build machine. Build the FPGA
 binary on an x86_64 Linux machine with Vitis installed, then copy the resulting
 `.xclbin` to the board.
 
-The current HLS kernel source is:
+The accelerator contains two specialized HLS compute units:
 
 ```text
-third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime/Conv2DKernel.cpp
+Conv1x1Kernel.cpp -> conv1x1_kernel
+Conv3x3Kernel.cpp -> conv3x3_kernel
 ```
 
-The Vitis build has two steps:
+The 1x1 kernel treats `N*H*W` as the GEMM row dimension while keeping the
+external tensors in NCHW/OIHW layout. The 3x3 kernel fully unrolls its nine
+spatial taps and evaluates four output channels and two input channels in
+parallel. Both kernels cache weights and share each input tile across a block
+of 16 output channels.
 
-```text
-Conv2DKernel.cpp -> conv2d_kernel.hw.xo
-conv2d_kernel.hw.xo -> conv2d_kernel.hw.xclbin
+Run the ordinary C++ numerical test before sending the sources to a Vitis
+machine:
+
+```sh
+scripts/test_myaccel_hls_kernels.sh
 ```
 
 It requires a KV260 Vitis platform `.xpfm`. If the platform is not already
@@ -508,26 +515,14 @@ cd ~/capstone-compiler
 source /opt/Xilinx/Vitis/2022.1/settings64.sh
 export PLATFORM=$HOME/xilinx-platforms/kria-vitis-platforms/kv260/platforms/xilinx_kv260_ispMipiRx_vcu_DP_202210_1/kv260_ispMipiRx_vcu_DP.xpfm
 
-mkdir -p build/kv260-hls
-
-v++ -c \
-  -t hw \
-  --platform "$PLATFORM" \
-  -k conv2d_kernel \
-  -I third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime \
-  third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime/Conv2DKernel.cpp \
-  -o build/kv260-hls/conv2d_kernel.hw.xo
-
-v++ -l \
-  -t hw \
-  --platform "$PLATFORM" \
-  build/kv260-hls/conv2d_kernel.hw.xo \
-  -o build/kv260-hls/conv2d_kernel.hw.xclbin
+scripts/build_kv260_conv2d_xclbin.sh
 ```
 
-Result:
+The script compiles two `.xo` files and links them into one xclbin:
 
 ```text
+build/kv260-hls/conv1x1_kernel.hw.xo
+build/kv260-hls/conv3x3_kernel.hw.xo
 build/kv260-hls/conv2d_kernel.hw.xclbin
 ```
 
@@ -541,9 +536,10 @@ scp build/kv260-hls/conv2d_kernel.hw.xclbin ubuntu@kria:~/dev/
 
 The ONNX-MLIR runtime still enters MyAccel through the external C call
 `my_conv_f32`. That function validates the ONNX tensor metadata, narrows the
-FPGA-supported parameters to 32-bit values, and calls the XRT wrapper. If the
-conv is unsupported or XRT fails, it falls back to the CPU reference
-convolution.
+FPGA-supported parameters to 32-bit values, and calls the XRT wrapper. A 1x1
+layer is dispatched to `conv1x1_kernel`; a 3x3 layer is dispatched to
+`conv3x3_kernel`. Other sizes, including the model's initial 6x6 layer, fall
+back to the CPU reference convolution.
 
 On the KV260, set the xclbin path before running the compiled model:
 
@@ -562,6 +558,18 @@ MYACCEL_FORCE_CPU=1 ./build/yolo-myaccel-driver-aarch64 \
   build/bus-input-aarch64.bin \
   build/bus-myaccel-aarch64.bin
 ```
+
+For a small board-side correctness test with transfer and compute timings,
+build and run the standalone XRT test on the KV260:
+
+```sh
+scripts/build_kv260_host_xrt_conv_test.sh
+scripts/run_kv260_conv2d_xrt_test.sh \
+  build/kv260-hls/conv2d_kernel.hw.xclbin
+```
+
+It reports BO allocation, host writes, H2D synchronization, `run.wait()`, D2H
+synchronization, and host reads separately for both kernels.
 
 ## Optional: run the arm64 artifacts locally with Docker
 

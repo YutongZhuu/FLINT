@@ -44,9 +44,10 @@ from different builds.
 
 ## Repository Inputs
 
-- Kernel source:
-  `third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime/Conv2DKernel.cpp`
-- Kernel name: `conv2d_kernel`
+- Kernel sources:
+  - `third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime/Conv1x1Kernel.cpp`
+  - `third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime/Conv3x3Kernel.cpp`
+- Kernel names: `conv1x1_kernel` and `conv3x3_kernel`
 - Existing helper: `scripts/build_kv260_conv2d_xclbin.sh`
 - Platform: `xilinx_kv260_ispMipiRx_vcu_DP_202210_1`
 - Target: `hw`
@@ -76,16 +77,25 @@ cd "$REPO_ROOT"
    v++ --compile \
      --target hw \
      --platform "$KV260_PLATFORM" \
-     --kernel conv2d_kernel \
+     --kernel conv1x1_kernel \
      --include third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime \
-     third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime/Conv2DKernel.cpp \
-     --output build/kv260-hls/conv2d_kernel.hw.xo
+     third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime/Conv1x1Kernel.cpp \
+     --output build/kv260-hls/conv1x1_kernel.hw.xo
+
+   v++ --compile \
+     --target hw \
+     --platform "$KV260_PLATFORM" \
+     --kernel conv3x3_kernel \
+     --include third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime \
+     third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime/Conv3x3Kernel.cpp \
+     --output build/kv260-hls/conv3x3_kernel.hw.xo
 
    v++ --link \
      --target hw \
      --platform "$KV260_PLATFORM" \
      --clock.defaultFreqHz 100000000 \
-     build/kv260-hls/conv2d_kernel.hw.xo \
+     build/kv260-hls/conv1x1_kernel.hw.xo \
+     build/kv260-hls/conv3x3_kernel.hw.xo \
      --output build/kv260-hls/conv2d_kernel.hw.xclbin
    ```
 
@@ -188,7 +198,7 @@ host probe be attempted.
 - All four required files exist and are non-empty.
 - The three binary files use the exact same `conv2d-kv260` basename.
 - `shell.json` declares `XRT_FLAT` and one slot.
-- `xclbinutil --info` reports `conv2d_kernel`, the KV260
+- `xclbinutil --info` reports both `conv1x1_kernel` and `conv3x3_kernel`, the KV260
   `ispMipiRx_vcu_DP` platform, hardware content, and a 100 MHz kernel clock.
 - The DTBO decompiles and contains the expected FPGA overlay and ZOCL nodes.
 - No board-side test is run.

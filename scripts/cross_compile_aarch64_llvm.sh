@@ -216,6 +216,7 @@ runtime_objects+=("$myaccel_xrt_obj")
   --gcc-toolchain="$gcc_toolchain" -B"$gcc_lib_dir" -B"$target_lib_dir" \
   -shared -fPIC \
   "$out_base.o" "${runtime_objects[@]}" \
+  "$linker_flag" \
   -L"$omp_lib_dir" -Wl,-rpath-link,"$omp_lib_dir" -lomp -lm \
   ${xrt_link_flags[@]+"${xrt_link_flags[@]}"} \
   -o "$out_base.so"
