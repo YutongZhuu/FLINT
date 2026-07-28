@@ -11,9 +11,13 @@ clangxx=${CLANGXX:-clang++}
 lld=${LLD:-}
 out_base=${AARCH64_OUT_BASE:-build/yolov5n-myaccel-aarch64}
 driver_out=${AARCH64_DRIVER_OUT:-build/yolo-myaccel-driver-aarch64}
+model=${AARCH64_MODEL:-build/yolov5n-fp32.onnx}
+opt_level=${ONNX_MLIR_OPT_LEVEL:-3}
 gcc_toolchain=${AARCH64_GCC_TOOLCHAIN:-$sysroot/usr}
 target_lib_dir=${AARCH64_TARGET_LIB_DIR:-$sysroot/usr/lib/aarch64-linux-gnu}
+omp_lib_dir=${AARCH64_OMP_LIB_DIR:-$sysroot/usr/lib/llvm-14/lib}
 myaccel_use_xrt=${MYACCEL_USE_XRT:-0}
+disable_recompose=${ONNX_MLIR_DISABLE_RECOMPOSE:-0}
 
 if [ -z "$sysroot" ]; then
   cat >&2 <<'EOF'
@@ -147,14 +151,25 @@ fi
 
 mkdir -p build/aarch64
 
+onnx_mlir_graph_flags=()
+if [ "$disable_recompose" = "1" ]; then
+  # Preserve each QDQ-wrapped Conv for MyAccel. ONNX-MLIR's recompose pass
+  # otherwise combines eight pairs of parallel YOLO convolutions into eight
+  # new FP32 Conv operations, which no longer match the INT8 rewrite.
+  onnx_mlir_graph_flags+=(--disable-recompose)
+fi
+
 "$onnx_mlir" \
   --maccel=MyAccel \
+  "${onnx_mlir_graph_flags[@]}" \
   --mtriple="$target" \
-  --march=aarch64 \
+  --mcpu=cortex-a53 \
+  --parallel \
+  --simd-data-layout \
   --EmitObj \
-  -O0 \
+  "-O$opt_level" \
   -o "$out_base" \
-  build/yolov5n-fp32.onnx
+  "$model"
 
 runtime_sources=(
   third_party/onnx-mlir/src/Runtime/OMTensor.c
@@ -179,6 +194,7 @@ for src in "${runtime_sources[@]}"; do
   "$clang" --target="$target" --sysroot="$sysroot" \
     --gcc-toolchain="$gcc_toolchain" -B"$gcc_lib_dir" -B"$target_lib_dir" \
     -std=c11 -O3 -fPIC -D_GNU_SOURCE \
+    -fopenmp=libomp -I"$sysroot/usr/lib/llvm-14/lib/clang/14.0.0/include" \
     -Ithird_party/onnx-mlir/include \
     -Ithird_party/onnx-mlir \
     -Ithird_party/onnx-mlir/src/Runtime \
@@ -192,7 +208,7 @@ myaccel_xrt_obj="build/aarch64/MyAccelXrt.o"
   --gcc-toolchain="$gcc_toolchain" -B"$gcc_lib_dir" -B"$target_lib_dir" \
   -std=c++17 -O3 -fPIC -Wno-unknown-pragmas \
   -Ithird_party/onnx-mlir/src/Accelerators/MyAccel/Runtime \
-  "${xrt_compile_flags[@]}" \
+  ${xrt_compile_flags[@]+"${xrt_compile_flags[@]}"} \
   -c third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime/MyAccelXrt.cpp -o "$myaccel_xrt_obj"
 runtime_objects+=("$myaccel_xrt_obj")
 
@@ -200,7 +216,8 @@ runtime_objects+=("$myaccel_xrt_obj")
   --gcc-toolchain="$gcc_toolchain" -B"$gcc_lib_dir" -B"$target_lib_dir" \
   -shared -fPIC \
   "$out_base.o" "${runtime_objects[@]}" \
-  "$linker_flag" -lm "${xrt_link_flags[@]}" \
+  -L"$omp_lib_dir" -Wl,-rpath-link,"$omp_lib_dir" -lomp -lm \
+  ${xrt_link_flags[@]+"${xrt_link_flags[@]}"} \
   -o "$out_base.so"
 
 "$clangxx" --target="$target" --sysroot="$sysroot" \
