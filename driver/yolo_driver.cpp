@@ -71,10 +71,6 @@ int main(int argc, char **argv) {
 
     OMTensor *output = omTensorListGetOmtByIndex(outputs, 0);
     printShape(output);
-    const int64_t *shape = omTensorGetShape(output);
-    if (omTensorGetRank(output) != 3 || shape[0] != 1 || shape[2] < 6)
-      throw std::runtime_error("unexpected YOLO output layout");
-
     const float *values = static_cast<const float *>(omTensorGetDataPtr(output));
     if (argc == 3) {
       std::ofstream dump(argv[2], std::ios::binary);
@@ -83,6 +79,10 @@ int main(int argc, char **argv) {
       dump.write(reinterpret_cast<const char *>(values),
           static_cast<std::streamsize>(omTensorGetNumElems(output) * sizeof(float)));
     }
+    const int64_t *shape = omTensorGetShape(output);
+    if (omTensorGetRank(output) != 3 || shape[0] != 1 || shape[2] < 6)
+      throw std::runtime_error("unexpected YOLO output layout");
+
     const int64_t candidates = shape[1];
     const int64_t fields = shape[2];
     float bestScore = -std::numeric_limits<float>::infinity();
