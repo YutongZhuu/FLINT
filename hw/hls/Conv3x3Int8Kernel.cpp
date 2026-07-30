@@ -127,6 +127,10 @@ OutputBlockLoop:
         LoadWeightColumnLoop:
           for (int kw = 0; kw < 3; ++kw) {
 #pragma HLS PIPELINE II = 1
+// Every flattened loop iteration writes a distinct OIHW cache element. Vitis
+// otherwise infers a false loop-carried read/write dependence on weight_cache
+// and schedules this preload at II=2.
+#pragma HLS DEPENDENCE variable = weight_cache inter false
             if (m < m_size) {
               const uint32_t weight_index =
                   (((uint32_t)m * c_size + c) * 3 + kh) * 3 + kw;
