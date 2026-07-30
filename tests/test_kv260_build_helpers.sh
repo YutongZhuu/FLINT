@@ -150,6 +150,7 @@ set -euo pipefail
 output=
 input=
 input_format=
+overlay_safe_decompile=0
 while [ $# -gt 0 ]; do
   case "$1" in
   -o)
@@ -162,6 +163,10 @@ while [ $# -gt 0 ]; do
     ;;
   -O)
     shift 2
+    ;;
+  -Wno-interrupts_property)
+    overlay_safe_decompile=1
+    shift
     ;;
   *)
     input=$1
@@ -176,6 +181,8 @@ if [ "$input_format" = dts ]; then
   grep -Fq '/plugin/;' "$input"
   grep -Fq '/ {' "$input"
   grep -Fq 'firmware-name' "$input"
+else
+  test "$overlay_safe_decompile" = 1
 fi
 cp "$input" "$output"
 EOF
@@ -183,6 +190,9 @@ EOF
 cat >"$mock_bin/xsct" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+
+test "${1:-}" = "-nodisp"
+shift
 
 xsct_script=$(mktemp)
 trap 'rm -f "$xsct_script"' EXIT

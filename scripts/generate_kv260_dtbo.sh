@@ -51,7 +51,9 @@ export KV260_DTG_XSA=$xsa_input
 export KV260_DTG_REPO=$dtg_repo
 export KV260_DTG_OUT=$temporary_dir/dtg
 
-xsct <<'EOF'
+# XSCT otherwise tries to validate DISPLAY and launch Xvfb, even though HSI is
+# used entirely headlessly here. Build servers commonly provide neither.
+xsct -nodisp <<'EOF'
 hsi open_hw_design $::env(KV260_DTG_XSA)
 hsi set_repo_path $::env(KV260_DTG_REPO)
 hsi create_sw_design device-tree -os device_tree -proc psu_cortexa53_0
@@ -84,7 +86,13 @@ if [ ! -s "$output" ]; then
 fi
 
 verification_dts=$temporary_dir/verify.dts
-dtc -I dtb -O dts -o "$verification_dts" "$output"
+# DTC 1.5.0 bundled with Vitis 2022.1 aborts in its interrupt checker while
+# decompiling a valid unresolved overlay (external phandles are 0xffffffff
+# until the base tree applies the fixups). Disable only that diagnostic for
+# this round-trip property check; the board's newer DTC still validates the
+# completed bundle before activation.
+dtc -Wno-interrupts_property -I dtb -O dts \
+  -o "$verification_dts" "$output"
 if ! grep -Fq "firmware-name = \"$app_name.bit.bin\"" "$verification_dts"; then
   echo "error: compiled DTBO firmware-name verification failed" >&2
   exit 1

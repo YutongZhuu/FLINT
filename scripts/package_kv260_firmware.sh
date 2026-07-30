@@ -41,7 +41,11 @@ trap 'rm -rf "$temporary_dir"' EXIT
 raw_bit="$temporary_dir/$app_name.bit"
 dtbo_dts="$temporary_dir/$app_name.dts"
 
-dtc -I dtb -O dts -o "$dtbo_dts" "$dtbo_input"
+# Vitis 2022.1 ships DTC 1.5.0, whose interrupt checker aborts when it sees
+# unresolved external phandles in an overlay. The check is not needed to read
+# firmware-name, so disable only that diagnostic during decompilation.
+dtc -Wno-interrupts_property -I dtb -O dts \
+  -o "$dtbo_dts" "$dtbo_input"
 firmware_name=$(sed -n \
   's/.*firmware-name[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
   "$dtbo_dts")
