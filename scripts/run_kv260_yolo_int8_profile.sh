@@ -122,8 +122,9 @@ if (( trace_artifact_count == 0 )); then
   exit 1
 fi
 if (( device_trace_count > 0 && device_trace_with_events == 0 )); then
-  echo "error: XRT device trace contains no events; rebuild the xclbin with " \
-    "VITIS_PROFILE=1" >&2
+  echo "error: XRT device trace contains no events; use xrt-counters.ini " \
+    "for a counter image, or rebuild the short-test image with " \
+    "VITIS_PROFILE=trace" >&2
   exit 1
 fi
 

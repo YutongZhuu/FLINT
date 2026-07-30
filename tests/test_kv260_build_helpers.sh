@@ -86,6 +86,7 @@ mkdir -p "$report_dir"
 printf 'mock timing\n' >"$report_dir/timing_summary.rpt"
 printf 'mock utilization\n' >"$report_dir/utilization.rpt"
 printf 'mock hierarchy\n' >"$report_dir/utilization_hierarchical.rpt"
+printf 'mock power\n' >"$report_dir/power.rpt"
 EOF
 
 cat >"$mock_bin/bootgen" <<'EOF'
@@ -148,13 +149,18 @@ set -euo pipefail
 
 output=
 input=
+input_format=
 while [ $# -gt 0 ]; do
   case "$1" in
   -o)
     output=$2
     shift 2
     ;;
-  -I|-O)
+  -I)
+    input_format=$2
+    shift 2
+    ;;
+  -O)
     shift 2
     ;;
   *)
@@ -165,7 +171,44 @@ while [ $# -gt 0 ]; do
 done
 test -n "$output"
 test -f "$input"
+if [ "$input_format" = dts ]; then
+  grep -Fq '/dts-v1/;' "$input"
+  grep -Fq '/plugin/;' "$input"
+  grep -Fq '/ {' "$input"
+  grep -Fq 'firmware-name' "$input"
+fi
 cp "$input" "$output"
+EOF
+
+cat >"$mock_bin/xsct" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+xsct_script=$(mktemp)
+trap 'rm -f "$xsct_script"' EXIT
+cat >"$xsct_script"
+grep -Fq 'hsi open_hw_design $::env(KV260_DTG_XSA)' "$xsct_script"
+grep -Fq 'hsi set_property CONFIG.dt_overlay true [hsi::get_os]' "$xsct_script"
+grep -Fq 'hsi set_property CONFIG.dt_zocl true [hsi::get_os]' "$xsct_script"
+grep -Fq 'hsi close_hw_design [hsi current_hw_design]' "$xsct_script"
+
+test -n "${KV260_DTG_XSA:-}"
+test -f "$KV260_DTG_XSA"
+test -n "${KV260_DTG_REPO:-}"
+test -d "$KV260_DTG_REPO"
+test -n "${KV260_DTG_OUT:-}"
+mkdir -p "$KV260_DTG_OUT"
+cat >"$KV260_DTG_OUT/pl.dtsi" <<'DTS'
+/dts-v1/;
+/plugin/;
+/ {
+  fragment@0 {
+    __overlay__ {
+      firmware-name = "vpl_gen_fixed.bit.bin";
+    };
+  };
+};
+DTS
 EOF
 
 cat >"$mock_bin/time" <<'EOF'
@@ -195,12 +238,30 @@ test -s "$test_root/hw-report/conv3x3_i8_kernel_csynth.rpt"
 test -s "$test_root/hw-report/conv6x6_stem_i8_kernel_csynth.rpt"
 test -s "$test_root/hw-report/timing_summary.rpt"
 test -s "$test_root/hw-report/utilization_hierarchical.rpt"
+test -s "$test_root/hw-report/power.rpt"
 test -s "$test_root/hw-out/conv_int8_only.hw.xsa"
 test -s "$test_root/hw-out/conv_int8_only.hw.bit.bin"
-grep -Fq -- '--profile.stall all:all:all' "$call_log"
-grep -Fq -- '--profile.data all:all:all:all' "$call_log"
-grep -Fq -- '--profile.exec all:all:all' "$call_log"
+grep -Fq -- '--profile.stall all:all:counters' "$call_log"
+grep -Fq -- '--profile.data conv1x1_i8_kernel:conv1x1_i8_kernel_1:m_axi_gmem0:counters' "$call_log"
+grep -Fq -- '--profile.data conv3x3_i8_kernel:conv3x3_i8_kernel_1:m_axi_gmem0:counters' "$call_log"
+if grep -Fq -- '--profile.exec' "$call_log"; then
+  echo "error: redundant execution monitor was requested" >&2
+  exit 1
+fi
 grep -Fq -- 'compiler.addOutputTypes=hw_export' "$call_log"
+
+: >"$call_log"
+PATH="$mock_bin:$PATH" \
+PLATFORM="$test_root/platform.xpfm" \
+TARGET=hw \
+VITIS_PROFILE=trace \
+VITIS_OUT_DIR="$test_root/trace-out" \
+VITIS_REPORT_DIR="$test_root/trace-report" \
+  ./hw/scripts/compile.sh >/dev/null
+grep -Fq -- '--profile.stall all:all:all' "$call_log"
+grep -Fq -- '--profile.data conv1x1_i8_kernel:conv1x1_i8_kernel_1:m_axi_gmem0:all' "$call_log"
+grep -Fq -- '--profile.data conv3x3_i8_kernel:conv3x3_i8_kernel_1:m_axi_gmem0:all' "$call_log"
+grep -Fq -- '--profile.trace_memory FIFO:8K' "$call_log"
 
 PATH="$mock_bin:$PATH" \
 PLATFORM="$test_root/platform.xpfm" \
@@ -213,7 +274,20 @@ test -s "$test_root/wrapper-report/conv3x3_i8_kernel_csynth.rpt"
 test ! -e "$test_root/wrapper-report/conv6x6_stem_i8_kernel_csynth.rpt"
 
 printf 'mock XCLBIN\n' >"$test_root/input.xclbin"
-printf 'firmware-name = "profile-app.bit.bin";\n' >"$test_root/matching.dtbo"
+printf 'mock XSA\n' >"$test_root/input.xsa"
+mkdir -p "$test_root/device-tree-xlnx"
+PATH="$mock_bin:$PATH" \
+KV260_APP_NAME=profile-app \
+DEVICE_TREE_REPO="$test_root/device-tree-xlnx" \
+  ./scripts/generate_kv260_dtbo.sh \
+    "$test_root/input.xsa" \
+    "$test_root/generated/profile-app.dtbo" >/dev/null
+test -s "$test_root/generated/profile-app.dtbo"
+test -s "$test_root/generated/profile-app.dts"
+grep -Fq 'firmware-name = "profile-app.bit.bin"' \
+  "$test_root/generated/profile-app.dtbo"
+
+cp "$test_root/generated/profile-app.dtbo" "$test_root/matching.dtbo"
 PATH="$mock_bin:$PATH" \
 KV260_APP_NAME=profile-app \
   ./scripts/package_kv260_firmware.sh \
@@ -352,6 +426,6 @@ if (
   exit 1
 fi
 grep -Fq 'device trace contains no events' "$test_root/no-events.stderr"
-grep -Fq 'VITIS_PROFILE=1' "$test_root/no-events.stderr"
+grep -Fq 'VITIS_PROFILE=trace' "$test_root/no-events.stderr"
 
 echo "PASS KV260 build, firmware, and XRT profile helpers"

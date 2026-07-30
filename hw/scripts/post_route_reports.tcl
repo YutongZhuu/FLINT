@@ -22,5 +22,7 @@ report_utilization \
   -hierarchical \
   -hierarchical_depth 6 \
   -file [file join $report_dir utilization_hierarchical.rpt]
+report_power \
+  -file [file join $report_dir power.rpt]
 
 close_design

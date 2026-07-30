@@ -457,23 +457,23 @@ binary on an x86_64 Linux machine with Vitis installed, then copy the resulting
 `.xclbin` to the board.
 
 The accelerator contains matching specialized FP32 and INT8 HLS compute
-units:
+units. The optimized INT8-only image also has an optional 6x6 stem:
 
 ```text
 Conv1x1Kernel.cpp -> conv1x1_kernel
 Conv3x3Kernel.cpp -> conv3x3_kernel
 Conv1x1Int8Kernel.cpp -> conv1x1_i8_kernel
 Conv3x3Int8Kernel.cpp -> conv3x3_i8_kernel
+Conv6x6StemInt8Kernel.cpp -> conv6x6_stem_i8_kernel (opt-in)
 ```
 
-The 1x1 kernel treats `N*H*W` as the GEMM row dimension while keeping the
-external tensors in NCHW/OIHW layout. The 3x3 kernel fully unrolls its nine
-spatial taps and evaluates four output channels and two input channels in
-parallel. The kernels cache weights and share each input tile across a block
-of 16 output channels. The INT8 engines support only the same 1x1 and 3x3
-envelope as FP32 and return raw INT32 accumulators. Other kernel sizes,
-including 6x6, fall back to the host. Bias and requantization are deliberately
-kept in the host runtime.
+The packed INT8 kernels preserve the logical NCHW/OIHW byte layout while using
+32-bit AXI words. They apply INT32 bias, fixed-point requantization, and INT8
+clamping in hardware, so the runtime no longer returns a full INT32 feature map
+to the Arm for post-processing. The default image contains 1x1 and 3x3 only.
+The 6x6 stem is a separate fit experiment and is enabled at build time with
+`VITIS_INCLUDE_6X6_STEM=1`, then at runtime with
+`MYACCEL_ENABLE_6X6_STEM=1`. Without both, the stem safely remains on the host.
 
 Run the ordinary C++ numerical test before sending the sources to a Vitis
 machine:
@@ -524,7 +524,44 @@ export PLATFORM=$HOME/xilinx-platforms/kria-vitis-platforms/kv260/platforms/xili
 scripts/build_kv260_conv2d_xclbin.sh
 ```
 
-The script compiles four `.xo` files and links them into one xclbin:
+For the packed INT8-only image and its routed reports, use:
+
+```sh
+scripts/build_kv260_int8_only_xclbin.sh
+```
+
+The default build has no debug monitors. `VITIS_PROFILE=1` (or `counters`)
+adds aggregate activation-bandwidth and CU-stall counters. The Vitis 2022.1
+KV260 platform used here has no trace-master decoration, so full DDR-backed
+device trace insertion fails before synthesis. `VITIS_PROFILE=trace` instead
+uses an 8 KiB on-chip FIFO and is intended only for the short standalone XRT
+tests, not a complete YOLO inference.
+
+Each hardware build collects `csynth.rpt` for every included kernel plus
+post-route timing, flat and hierarchical utilization, and estimated power.
+Generate the overlay from that build's XSA, then package the matched XRT_FLAT
+firmware set:
+
+```sh
+export DEVICE_TREE_REPO=$HOME/tools/device-tree-xlnx-2022.1
+export KV260_APP_NAME=conv2d-int8
+
+scripts/generate_kv260_dtbo.sh \
+  build/kv260-int8-only/conv_int8_only.hw.xsa \
+  build/kv260-firmware/conv2d-int8/conv2d-int8.dtbo
+
+scripts/package_kv260_firmware.sh \
+  build/kv260-int8-only/conv_int8_only.hw.xclbin \
+  build/kv260-firmware/conv2d-int8/conv2d-int8.dtbo \
+  build/kv260-firmware/conv2d-int8
+```
+
+The generator enables overlay/ZOCL nodes and verifies that the compiled DTBO
+names `conv2d-int8.bit.bin`. Keep the resulting `.bit.bin`, `.dtbo`, `.xclbin`,
+and `shell.json` together; do not reuse an overlay from another XSA.
+
+The generic `build_kv260_conv2d_xclbin.sh` script compiles four `.xo` files
+and links them into one xclbin:
 
 ```text
 build/kv260-hls/conv1x1_kernel.hw.xo
@@ -543,11 +580,10 @@ scp build/kv260-hls/conv2d_kernel.hw.xclbin ubuntu@kria:~/dev/
 ## Run with XRT on KV260
 
 QDQ convolutions enter MyAccel through `my_conv_qdq_i8`. The XRT wrapper sends
-supported layers to `conv1x1_i8_kernel` or `conv3x3_i8_kernel`, which return
-only the centered INT32 convolution accumulators. The host applies the INT32
-bias and output requantization; the following ONNX `DequantizeLinear` also
-remains on the host. A 6x6 or otherwise unsupported INT8 layer uses the same
-host INT8 implementation.
+supported layers to `conv1x1_i8_kernel` or `conv3x3_i8_kernel`; those kernels
+return the final requantized INT8 tensor. A 6x6 layer uses the optional stem
+kernel only when both the matching image and runtime gate are enabled. Other
+unsupported INT8 layers use the same bit-exact host implementation.
 
 FP32 convolutions continue to enter through `my_conv_f32`: supported 1x1 and
 3x3 layers use `conv1x1_kernel` and `conv3x3_kernel`, while other FP32 layers
@@ -622,6 +658,27 @@ The summary includes:
 - total instrumented time
 - total process wall/CPU time
 
+For a KV260 run, select the XRT configuration that matches the linked image:
+
+```sh
+# No device monitors: host XRT API timeline plus MYACCEL per-layer timings.
+MYACCEL_XRT_INI=$PWD/scripts/xrt-host-profile.ini \
+  scripts/run_kv260_yolo_int8_profile.sh
+
+# VITIS_PROFILE=counters image: add aggregate device bandwidth/stall counters.
+MYACCEL_XRT_INI=$PWD/scripts/xrt-counters.ini \
+  scripts/run_kv260_yolo_int8_profile.sh
+
+# VITIS_PROFILE=trace image: one short HostXrtConvTest invocation only.
+XRT_INI_PATH=$PWD/scripts/xrt-profile.ini \
+  ./host_xrt_int8_test ./conv_int8_only.hw.xclbin --int8-3x3-only
+```
+
+`xdputil` inspects and benchmarks Vitis AI DPU/xmodel deployments. These are
+custom HLS/XRT kernels, so their scheduling evidence comes from HLS reports,
+their routed evidence from Vivado reports, and their runtime evidence from XRT
+plus the MyAccel timing log.
+
 ## Scripts
 
 The scripts are intentionally thin wrappers behind Make targets:
@@ -633,6 +690,10 @@ cross_compile_aarch64_llvm.sh    macOS -> Linux/aarch64 cross compile
 package_aarch64_artifacts.sh     board tarball assembly
 run_yolo_aarch64_docker.sh       optional Ubuntu 22.04 arm64 runtime smoke test
 profile_yolo_ops.sh              local ONNX op profiling
+build_kv260_int8_only_xclbin.sh  packed INT8 hardware image and reports
+generate_kv260_dtbo.sh           matching XSA-to-overlay generation
+package_kv260_firmware.sh        checked XRT_FLAT firmware bundle
+run_kv260_yolo_int8_profile.sh   board XRT/MyAccel profiling
 ```
 
 Python helpers:

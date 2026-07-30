@@ -13,7 +13,7 @@ out_dir=${VITIS_OUT_DIR:-build}
 report_dir=${VITIS_REPORT_DIR:-report}
 platform=${PLATFORM:-${KV260_PLATFORM:-}}
 kernel_clock_hz=${KV260_KERNEL_CLOCK_HZ:-100000000}
-enable_profile=${VITIS_PROFILE:-0}
+profile_mode=${VITIS_PROFILE:-0}
 include_6x6_stem=${VITIS_INCLUDE_6X6_STEM:-0}
 compile_temp_root=$out_dir/vitis-compile
 compile_log_root=$out_dir/vitis-logs
@@ -26,10 +26,18 @@ esac
 
 post_route_report_tcl=$hw_dir/scripts/post_route_reports.tcl
 
-case "$enable_profile" in
-0|1) ;;
+case "$profile_mode" in
+0) ;;
+1|counters)
+  # Keep VITIS_PROFILE=1 as the safe default for existing callers. The KV260
+  # platform used by this project cannot route trace traffic through its
+  # undecorated PS HP ports with Vitis 2022.1, but counter monitors do not need
+  # that offload path.
+  profile_mode=counters
+  ;;
+trace) ;;
 *)
-  echo "error: VITIS_PROFILE must be 0 or 1, got: $enable_profile" >&2
+  echo "error: VITIS_PROFILE must be 0, 1, counters, or trace, got: $profile_mode" >&2
   exit 2
   ;;
 esac
@@ -136,14 +144,32 @@ xclbin="$out_dir/conv_int8_only.$target.xclbin"
 compile_profile_args=()
 link_profile_args=()
 link_export_args=()
-if [ "$enable_profile" = "1" ]; then
-  # Stall ports must be enabled while compiling each kernel. Data, stall, and
-  # execution monitors are then inserted while linking the system image.
+if [ "$profile_mode" != "0" ]; then
+  # Stall ports must be enabled while compiling each kernel. A stall monitor
+  # also supplies execution counters, so a second --profile.exec monitor is
+  # redundant.
   compile_profile_args+=(--profile.stall all:all:all)
+fi
+if [ "$profile_mode" = "counters" ]; then
+  # Instrument aggregate CU stalls plus the activation input of each kernel.
+  # Monitoring every bundle creates sixteen AIMs on this platform because each
+  # logical port expands across HP and HP1, which is unnecessary for locating
+  # the activation-loader bottleneck.
   link_profile_args+=(
-    --profile.data all:all:all:all
+    --profile.stall all:all:counters
+    --profile.data conv1x1_i8_kernel:conv1x1_i8_kernel_1:m_axi_gmem0:counters
+    --profile.data conv3x3_i8_kernel:conv3x3_i8_kernel_1:m_axi_gmem0:counters
+  )
+elif [ "$profile_mode" = "trace" ]; then
+  # The platform has no DPA_TRACE_SLAVE decoration. Vitis 2022.1 otherwise
+  # chooses a PS HP port and fails while inserting the trace offload path. A
+  # small on-chip FIFO avoids that platform bug; use this image only for short
+  # one-layer host tests because a full-network trace can overflow 8 KiB.
+  link_profile_args+=(
     --profile.stall all:all:all
-    --profile.exec all:all:all
+    --profile.data conv1x1_i8_kernel:conv1x1_i8_kernel_1:m_axi_gmem0:all
+    --profile.data conv3x3_i8_kernel:conv3x3_i8_kernel_1:m_axi_gmem0:all
+    --profile.trace_memory FIFO:8K
   )
 fi
 if [ "$target" = "hw" ]; then
@@ -261,8 +287,10 @@ printf 'HLS report: %s/conv3x3_i8_kernel_csynth.rpt\n' "$report_dir"
 if [ "$include_6x6_stem" = "1" ]; then
   printf 'HLS report: %s/conv6x6_stem_i8_kernel_csynth.rpt\n' "$report_dir"
 fi
-if [ "$enable_profile" = "1" ]; then
-  printf 'XRT profiling instrumentation: data, stall, and execution\n'
+if [ "$profile_mode" = "counters" ]; then
+  printf 'XRT profiling instrumentation: activation data and stall counters\n'
+elif [ "$profile_mode" = "trace" ]; then
+  printf 'XRT profiling instrumentation: activation/stall trace in 8 KiB FIFO\n'
 fi
 
 if [ "$target" = "hw" ]; then
@@ -291,7 +319,8 @@ if [ "$target" = "hw" ]; then
   for final_report in \
     timing_summary.rpt \
     utilization.rpt \
-    utilization_hierarchical.rpt; do
+    utilization_hierarchical.rpt \
+    power.rpt; do
     if [ ! -s "$report_dir/$final_report" ]; then
       echo "error: Vivado did not produce $report_dir/$final_report" >&2
       exit 1
@@ -329,4 +358,5 @@ if [ "$target" = "hw" ]; then
   printf 'Utilization report: %s/utilization.rpt\n' "$report_dir"
   printf 'Hierarchical utilization: %s/utilization_hierarchical.rpt\n' \
     "$report_dir"
+  printf 'Power estimate: %s/power.rpt\n' "$report_dir"
 fi
