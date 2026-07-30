@@ -6,6 +6,8 @@ cd "$(dirname "$0")/.."
 kernel_inc=third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime
 conv1x1_src=$kernel_inc/Conv1x1Kernel.cpp
 conv3x3_src=$kernel_inc/Conv3x3Kernel.cpp
+conv1x1_i8_src=$kernel_inc/Conv1x1Int8Kernel.cpp
+conv3x3_i8_src=$kernel_inc/Conv3x3Int8Kernel.cpp
 target=${TARGET:-${VITIS_TARGET:-hw}}
 out_dir=${VITIS_OUT_DIR:-${KV260_HLS_OUTPUT_DIR:-build/kv260-hls}}
 platform=${PLATFORM:-${KV260_PLATFORM:-}}
@@ -41,6 +43,8 @@ mkdir -p "$out_dir"
 
 conv1x1_xo="$out_dir/conv1x1_kernel.$target.xo"
 conv3x3_xo="$out_dir/conv3x3_kernel.$target.xo"
+conv1x1_i8_xo="$out_dir/conv1x1_i8_kernel.$target.xo"
+conv3x3_i8_xo="$out_dir/conv3x3_i8_kernel.$target.xo"
 xclbin="$out_dir/conv2d_kernel.$target.xclbin"
 
 v++ -c \
@@ -59,12 +63,30 @@ v++ -c \
   "$conv3x3_src" \
   -o "$conv3x3_xo"
 
+v++ -c \
+  -t "$target" \
+  --platform "$platform" \
+  -k conv1x1_i8_kernel \
+  -I "$kernel_inc" \
+  "$conv1x1_i8_src" \
+  -o "$conv1x1_i8_xo"
+
+v++ -c \
+  -t "$target" \
+  --platform "$platform" \
+  -k conv3x3_i8_kernel \
+  -I "$kernel_inc" \
+  "$conv3x3_i8_src" \
+  -o "$conv3x3_i8_xo"
+
 v++ -l \
   -t "$target" \
   --platform "$platform" \
   --clock.defaultFreqHz "$kernel_clock_hz" \
   "$conv1x1_xo" \
   "$conv3x3_xo" \
+  "$conv1x1_i8_xo" \
+  "$conv3x3_i8_xo" \
   -o "$xclbin"
 
 printf 'built %s\n' "$xclbin"

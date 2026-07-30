@@ -10,3 +10,4 @@ build/
 
 third_party/onnx-mlir/build*/
 build/llvm-project-onnxmlir/
+kv260-xrt-2.13.0

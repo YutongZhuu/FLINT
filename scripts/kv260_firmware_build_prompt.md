@@ -47,7 +47,10 @@ from different builds.
 - Kernel sources:
   - `third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime/Conv1x1Kernel.cpp`
   - `third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime/Conv3x3Kernel.cpp`
-- Kernel names: `conv1x1_kernel` and `conv3x3_kernel`
+  - `third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime/Conv1x1Int8Kernel.cpp`
+  - `third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime/Conv3x3Int8Kernel.cpp`
+- Kernel names: `conv1x1_kernel`, `conv3x3_kernel`, `conv1x1_i8_kernel`,
+  and `conv3x3_i8_kernel`
 - Existing helper: `scripts/build_kv260_conv2d_xclbin.sh`
 - Platform: `xilinx_kv260_ispMipiRx_vcu_DP_202210_1`
 - Target: `hw`
@@ -90,12 +93,30 @@ cd "$REPO_ROOT"
      third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime/Conv3x3Kernel.cpp \
      --output build/kv260-hls/conv3x3_kernel.hw.xo
 
+   v++ --compile \
+     --target hw \
+     --platform "$KV260_PLATFORM" \
+     --kernel conv1x1_i8_kernel \
+     --include third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime \
+     third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime/Conv1x1Int8Kernel.cpp \
+     --output build/kv260-hls/conv1x1_i8_kernel.hw.xo
+
+   v++ --compile \
+     --target hw \
+     --platform "$KV260_PLATFORM" \
+     --kernel conv3x3_i8_kernel \
+     --include third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime \
+     third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime/Conv3x3Int8Kernel.cpp \
+     --output build/kv260-hls/conv3x3_i8_kernel.hw.xo
+
    v++ --link \
      --target hw \
      --platform "$KV260_PLATFORM" \
      --clock.defaultFreqHz 100000000 \
      build/kv260-hls/conv1x1_kernel.hw.xo \
      build/kv260-hls/conv3x3_kernel.hw.xo \
+     build/kv260-hls/conv1x1_i8_kernel.hw.xo \
+     build/kv260-hls/conv3x3_i8_kernel.hw.xo \
      --output build/kv260-hls/conv2d_kernel.hw.xclbin
    ```
 
@@ -198,7 +219,8 @@ host probe be attempted.
 - All four required files exist and are non-empty.
 - The three binary files use the exact same `conv2d-kv260` basename.
 - `shell.json` declares `XRT_FLAT` and one slot.
-- `xclbinutil --info` reports both `conv1x1_kernel` and `conv3x3_kernel`, the KV260
+- `xclbinutil --info` reports `conv1x1_kernel`, `conv3x3_kernel`,
+  `conv1x1_i8_kernel`, and `conv3x3_i8_kernel`, the KV260
   `ispMipiRx_vcu_DP` platform, hardware content, and a 100 MHz kernel clock.
 - The DTBO decompiles and contains the expected FPGA overlay and ZOCL nodes.
 - No board-side test is run.

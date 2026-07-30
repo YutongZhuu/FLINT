@@ -98,7 +98,7 @@ Quantization and compilation are separate steps in this project:
    this step and the resulting model contains fixed scales, zero points, INT8
    weights, and `QuantizeLinear`/`DequantizeLinear` operations.
 2. The modified ONNX-MLIR compiler recognizes a QDQ-wrapped `onnx.Conv` and
-   lowers it to `my_conv_qdq_i8_f32` instead of first materializing FP32 input
+   lowers it to `my_conv_qdq_i8` instead of first materializing FP32 input
    and weight tensors for `my_conv_f32`.
 
 ONNX-MLIR does **not** quantize an FP32 model during compilation. Passing
@@ -234,16 +234,16 @@ MODEL=models/yolov5n-ultralytics-standard_int8.onnx
   -o build/yolov5n-int8-myaccel-inspect \
   "$MODEL"
 
-grep -c 'my_conv_qdq_i8_f32' \
+grep -c 'my_conv_qdq_i8' \
   build/yolov5n-int8-myaccel-inspect.onnx.mlir
 grep -c 'my_conv_f32' \
   build/yolov5n-int8-myaccel-inspect.onnx.mlir
 ```
 
-`my_conv_qdq_i8_f32` means that the Conv uses INT8 input/weights and INT32
+`my_conv_qdq_i8` means that the Conv uses INT8 input/weights and INT32
 accumulation in the custom runtime. `my_conv_f32` identifies an FP32 fallback.
-For the current YOLOv5n export, this check reports 44 INT8 calls and 8 FP32
-fallback calls.
+For the current YOLOv5n export, `tests/myaccel/test_qdq_fusion.sh` expects 60
+INT8 calls and no FP32 convolution fallbacks.
 The exact counts can change when ONNX-MLIR optimizations fuse or reshape the
 graph, so inspect both counts rather than assuming every source Conv remains a
 separate call.
@@ -456,18 +456,24 @@ The KV260 is the runtime target, not the Vitis build machine. Build the FPGA
 binary on an x86_64 Linux machine with Vitis installed, then copy the resulting
 `.xclbin` to the board.
 
-The accelerator contains two specialized HLS compute units:
+The accelerator contains matching specialized FP32 and INT8 HLS compute
+units:
 
 ```text
 Conv1x1Kernel.cpp -> conv1x1_kernel
 Conv3x3Kernel.cpp -> conv3x3_kernel
+Conv1x1Int8Kernel.cpp -> conv1x1_i8_kernel
+Conv3x3Int8Kernel.cpp -> conv3x3_i8_kernel
 ```
 
 The 1x1 kernel treats `N*H*W` as the GEMM row dimension while keeping the
 external tensors in NCHW/OIHW layout. The 3x3 kernel fully unrolls its nine
 spatial taps and evaluates four output channels and two input channels in
-parallel. Both kernels cache weights and share each input tile across a block
-of 16 output channels.
+parallel. The kernels cache weights and share each input tile across a block
+of 16 output channels. The INT8 engines support only the same 1x1 and 3x3
+envelope as FP32 and return raw INT32 accumulators. Other kernel sizes,
+including 6x6, fall back to the host. Bias and requantization are deliberately
+kept in the host runtime.
 
 Run the ordinary C++ numerical test before sending the sources to a Vitis
 machine:
@@ -518,11 +524,13 @@ export PLATFORM=$HOME/xilinx-platforms/kria-vitis-platforms/kv260/platforms/xili
 scripts/build_kv260_conv2d_xclbin.sh
 ```
 
-The script compiles two `.xo` files and links them into one xclbin:
+The script compiles four `.xo` files and links them into one xclbin:
 
 ```text
 build/kv260-hls/conv1x1_kernel.hw.xo
 build/kv260-hls/conv3x3_kernel.hw.xo
+build/kv260-hls/conv1x1_i8_kernel.hw.xo
+build/kv260-hls/conv3x3_i8_kernel.hw.xo
 build/kv260-hls/conv2d_kernel.hw.xclbin
 ```
 
@@ -534,12 +542,16 @@ scp build/kv260-hls/conv2d_kernel.hw.xclbin ubuntu@kria:~/dev/
 
 ## Run with XRT on KV260
 
-The ONNX-MLIR runtime still enters MyAccel through the external C call
-`my_conv_f32`. That function validates the ONNX tensor metadata, narrows the
-FPGA-supported parameters to 32-bit values, and calls the XRT wrapper. A 1x1
-layer is dispatched to `conv1x1_kernel`; a 3x3 layer is dispatched to
-`conv3x3_kernel`. Other sizes, including the model's initial 6x6 layer, fall
-back to the CPU reference convolution.
+QDQ convolutions enter MyAccel through `my_conv_qdq_i8`. The XRT wrapper sends
+supported layers to `conv1x1_i8_kernel` or `conv3x3_i8_kernel`, which return
+only the centered INT32 convolution accumulators. The host applies the INT32
+bias and output requantization; the following ONNX `DequantizeLinear` also
+remains on the host. A 6x6 or otherwise unsupported INT8 layer uses the same
+host INT8 implementation.
+
+FP32 convolutions continue to enter through `my_conv_f32`: supported 1x1 and
+3x3 layers use `conv1x1_kernel` and `conv3x3_kernel`, while other FP32 layers
+fall back to the host reference.
 
 On the KV260, set the xclbin path before running the compiled model:
 
@@ -551,10 +563,11 @@ export MYACCEL_XCLBIN=$HOME/dev/conv2d_kernel.hw.xclbin
   build/bus-myaccel-aarch64.bin
 ```
 
-Use `MYACCEL_FORCE_CPU=1` to force the CPU fallback path:
+Use `CPU=1` to keep convolution on the host. `MYACCEL_FORCE_CPU=1` remains
+available as a compatibility alias:
 
 ```sh
-MYACCEL_FORCE_CPU=1 ./build/yolo-myaccel-driver-aarch64 \
+CPU=1 ./build/yolo-myaccel-driver-aarch64 \
   build/bus-input-aarch64.bin \
   build/bus-myaccel-aarch64.bin
 ```
@@ -569,7 +582,7 @@ scripts/run_kv260_conv2d_xrt_test.sh \
 ```
 
 It reports BO allocation, host writes, H2D synchronization, `run.wait()`, D2H
-synchronization, and host reads separately for both kernels.
+synchronization, and host reads separately for all four kernels.
 
 ## Optional: run the arm64 artifacts locally with Docker
 

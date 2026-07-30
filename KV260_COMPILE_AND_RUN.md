@@ -123,7 +123,7 @@ cd kria-vitis-platforms/kv260
 make platform PFM=kv260_ispMipiRx_vcu_DP
 ```
 
-## 3. Compile the FPGA kernel
+## 3. Compile the FPGA kernels
 
 Return to the repository root on the Vitis machine:
 
@@ -133,33 +133,24 @@ source /opt/Xilinx/Vitis/2022.1/settings64.sh
 mkdir -p build/kv260-hls
 ```
 
-Compile the C++ kernel into a Vitis hardware object:
+Compile the two FP32 and two INT8 kernels, then link them into one 100 MHz
+xclbin:
 
 ```sh
-v++ --compile \
-  --target hw \
-  --platform "$KV260_PLATFORM" \
-  --kernel conv2d_kernel \
-  --include third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime \
-  third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime/Conv2DKernel.cpp \
-  --output build/kv260-hls/conv2d_kernel.hw.xo
-```
-
-Link the object into a hardware `.xclbin` at 100 MHz:
-
-```sh
-v++ --link \
-  --target hw \
-  --platform "$KV260_PLATFORM" \
-  --clock.defaultFreqHz 100000000 \
-  build/kv260-hls/conv2d_kernel.hw.xo \
-  --output build/kv260-hls/conv2d_kernel.hw.xclbin
+PLATFORM="$KV260_PLATFORM" \
+KV260_KERNEL_CLOCK_HZ=100000000 \
+scripts/build_kv260_conv2d_xclbin.sh
 ```
 
 Verify the result:
 
 ```sh
-ls -lh build/kv260-hls/conv2d_kernel.hw.{xo,xclbin}
+ls -lh \
+  build/kv260-hls/conv1x1_kernel.hw.xo \
+  build/kv260-hls/conv3x3_kernel.hw.xo \
+  build/kv260-hls/conv1x1_i8_kernel.hw.xo \
+  build/kv260-hls/conv3x3_i8_kernel.hw.xo \
+  build/kv260-hls/conv2d_kernel.hw.xclbin
 
 xclbinutil --info \
   --input build/kv260-hls/conv2d_kernel.hw.xclbin
@@ -167,14 +158,13 @@ xclbinutil --info \
 
 Confirm that the metadata reports:
 
-- `conv2d_kernel`
+- `conv1x1_kernel`
+- `conv3x3_kernel`
+- `conv1x1_i8_kernel`
+- `conv3x3_i8_kernel`
 - hardware content
 - the KV260 `ispMipiRx_vcu_DP` platform
 - a 100 MHz kernel clock
-
-The repository also contains `scripts/build_kv260_conv2d_xclbin.sh`, but its
-current link command does not set the required 100 MHz clock. For a reproducible
-demo, use the explicit commands above.
 
 ## 4. Build the matched Kria firmware application
 
@@ -405,27 +395,32 @@ First, test only device and kernel setup:
 Expected ending:
 
 ```text
-[host-xrt-test] XRT setup completed
-[host-xrt-test] probe-only requested; exiting before kernel launch
+PASS loaded xclbin and opened all kernel handles
 ```
 
-Next, run the default tiny `1x1x4x4` convolution:
+Next, run all four numerical tests:
 
 ```sh
 ./host_xrt_conv_test ./conv2d_kernel.hw.xclbin
 ```
 
-Expected result:
+Expected results include:
 
 ```text
-PASS case=tiny max_abs_diff=...
+PASS conv1x1_kernel ...
+PASS conv3x3_kernel ...
+PASS conv1x1_i8_kernel exact_int32_outputs=...
+PASS conv3x3_i8_kernel exact_int32_outputs=...
 ```
 
-The FPGA output is compared with a CPU reference using a tolerance of `1e-4`.
-Only after the tiny test passes should both tiny and medium tests be run:
+The FP32 outputs are compared with a CPU reference using a tolerance of
+`1e-4`; the INT8 kernels' raw INT32 accumulators must match exactly.
+Individual kernels can be selected while diagnosing a failure:
 
 ```sh
-./host_xrt_conv_test ./conv2d_kernel.hw.xclbin --all
+./host_xrt_conv_test ./conv2d_kernel.hw.xclbin --1x1-only
+./host_xrt_conv_test ./conv2d_kernel.hw.xclbin --3x3-only
+./host_xrt_conv_test ./conv2d_kernel.hw.xclbin --int8-only
 ```
 
 The host test defaults to a 30-second total alarm and a 5-second kernel wait.
@@ -446,6 +441,7 @@ cd /home/ubuntu/dev/runtime
 
 export MYACCEL_XCLBIN="$PWD/conv2d_kernel.hw.xclbin"
 export LD_LIBRARY_PATH="$PWD:$PWD/runtime-libs"
+unset CPU
 unset MYACCEL_FORCE_CPU
 
 ./yolo-myaccel-driver-aarch64 \
@@ -467,10 +463,9 @@ MYACCEL_MAX_OUTPUT_PIXELS=6400
 MYACCEL_MAX_IO_BYTES=33554432
 ```
 
-Convolutions exceeding either limit fall back to the CPU. Therefore, the
-normal full-model run may use both FPGA and CPU execution. This is intentional:
-the current kernel is correctness-oriented and not yet optimized for large
-YOLO layers.
+INT8 convolutions honor the I/O-byte limit. FP32 convolutions honor both
+limits. A layer that exceeds its applicable guard falls back to the CPU. The
+normal full-model run may therefore use both FPGA and CPU execution.
 
 Do not disable these guards during a teammate demo. Setting either limit to
 `0` disables that guard and may allow a very long FPGA execution.
@@ -483,7 +478,7 @@ Use the same AArch64 model and driver while bypassing XRT for every Conv:
 cd /home/ubuntu/dev/runtime
 export LD_LIBRARY_PATH="$PWD:$PWD/runtime-libs"
 
-MYACCEL_FORCE_CPU=1 \
+CPU=1 \
 ./yolo-myaccel-driver-aarch64 \
   ./bus-input-aarch64.bin \
   ./bus-myaccel-cpu.bin
@@ -492,23 +487,30 @@ MYACCEL_FORCE_CPU=1 \
 The runtime should report a fallback reason similar to:
 
 ```text
-MYACCEL_FORCE_CPU is set
+CPU=1 or MYACCEL_FORCE_CPU is set
 ```
 
-`MYACCEL_FORCE_CPU` is presence-based. This still forces the CPU:
+Only the exact value `CPU=1` selects this path:
 
 ```sh
-MYACCEL_FORCE_CPU=0 ./yolo-myaccel-driver-aarch64 ...
+CPU=1 ./yolo-myaccel-driver-aarch64 ...
 ```
 
 Return to normal guarded XRT routing with:
 
 ```sh
+unset CPU
+```
+
+`MYACCEL_FORCE_CPU=1` remains available as a compatibility alias:
+
+```sh
+MYACCEL_FORCE_CPU=1 ./yolo-myaccel-driver-aarch64 ...
 unset MYACCEL_FORCE_CPU
 ```
 
 The standalone `host_xrt_conv_test` always exercises XRT directly and is not
-affected by `MYACCEL_FORCE_CPU`.
+affected by `CPU` or `MYACCEL_FORCE_CPU`.
 
 ## 12. Demo order
 
@@ -520,7 +522,7 @@ For a reliable live demonstration, use this order:
 4. Install and activate `conv2d-kv260`.
 5. Show `xbutil examine` reporting a ready device.
 6. Run `--probe-only`.
-7. Run the tiny Conv test and show `PASS`.
+7. Run the four Conv tests and show `PASS`.
 8. Run forced-CPU YOLO as a stable software baseline.
 9. Optionally run guarded XRT YOLO and explain per-layer CPU fallbacks.
 
@@ -601,4 +603,3 @@ ldd ./yolo-myaccel-driver-aarch64
 
 Inspect the exact model library path reported by `ldd`; do not diagnose a
 duplicate or stale copy elsewhere.
-

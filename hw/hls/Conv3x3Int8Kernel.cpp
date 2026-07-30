@@ -108,7 +108,9 @@ OutputBlockLoop:
     factor = kInputParallel dim = 2
 #pragma HLS ARRAY_PARTITION variable = weight_cache complete dim = 3
 #pragma HLS ARRAY_PARTITION variable = weight_cache complete dim = 4
-#pragma HLS BIND_STORAGE variable = weight_cache type = ram_2p impl = lutram
+// The nine independently-read tap planes use URAM so their 2,592-bit/cycle
+// aggregate bandwidth does not consume distributed LUT RAM.
+#pragma HLS BIND_STORAGE variable = weight_cache type = ram_2p impl = uram
 
   LoadWeightOutputLoop:
     for (int local_m = 0; local_m < kOutputBlock; ++local_m) {
@@ -147,20 +149,26 @@ OutputBlockLoop:
 #pragma HLS ARRAY_PARTITION variable = input_tile complete dim = 1
 #pragma HLS ARRAY_PARTITION variable = input_tile complete dim = 2
 #pragma HLS ARRAY_PARTITION variable = input_tile complete dim = 3
+// Pack eight output lanes into one 256-bit word and retain tile positions as
+// RAM depth. Partitioning tile positions would waste one BRAM per shallow bank.
 #pragma HLS ARRAY_RESHAPE variable = accum cyclic \
     factor = kOutputParallel dim = 1
-#pragma HLS ARRAY_PARTITION variable = accum complete dim = 2
-#pragma HLS ARRAY_PARTITION variable = accum complete dim = 3
-#pragma HLS BIND_STORAGE variable = accum type = ram_2p impl = lutram
+#pragma HLS BIND_STORAGE variable = accum type = ram_2p impl = bram
 
-        InitAccumOutputLoop:
-          for (int local_m = 0; local_m < kOutputBlock; ++local_m) {
+        InitAccumOutputGroupLoop:
+          for (int output_base = 0; output_base < kOutputBlock;
+               output_base += kOutputParallel) {
           InitAccumRowLoop:
             for (int local_oh = 0; local_oh < kOutputTileHeight; ++local_oh) {
             InitAccumColumnLoop:
               for (int local_ow = 0; local_ow < kOutputTileWidth; ++local_ow) {
 #pragma HLS PIPELINE II = 1
-                accum[local_m][local_oh][local_ow] = 0;
+              InitAccumLaneLoop:
+                for (int output_lane = 0;
+                     output_lane < kOutputParallel; ++output_lane) {
+#pragma HLS UNROLL
+                  accum[output_base + output_lane][local_oh][local_ow] = 0;
+                }
               }
             }
           }

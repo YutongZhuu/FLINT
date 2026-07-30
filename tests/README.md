@@ -6,6 +6,16 @@ Run the MyAccel QDQ runtime tests:
 ./tests/myaccel/test_qdq_runtime.sh
 ```
 
+This exercises both `CPU=1` host execution and the INT8 accelerator boundary
+with host-side bias and requantization. It also verifies that a 6x6 INT8
+convolution does not invoke XRT and uses the software fallback.
+
+Run the ordinary C++ numerical models for all HLS kernels:
+
+```bash
+./scripts/test_myaccel_hls_kernels.sh
+```
+
 Verify that the YOLOv5n INT8 model lowers to 60 fused INT8 convolution calls:
 
 ```bash

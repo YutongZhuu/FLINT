@@ -77,7 +77,7 @@ OutputBlockLoop:
     factor = kOutputParallel dim = 1
 #pragma HLS ARRAY_RESHAPE variable = weight_cache cyclic \
     factor = kInputParallel dim = 2
-#pragma HLS BIND_STORAGE variable = weight_cache type = ram_2p impl = lutram
+#pragma HLS BIND_STORAGE variable = weight_cache type = ram_2p impl = bram
 
   LoadWeightOutputLoop:
     for (int local_m = 0; local_m < kOutputBlock; ++local_m) {
@@ -101,18 +101,24 @@ OutputBlockLoop:
         centered_t input_tile[kInputParallel][kPixelTile];
         int32_t accum[kOutputBlock][kPixelTile];
 #pragma HLS ARRAY_PARTITION variable = input_tile complete dim = 1
+// Pack eight output lanes into one 256-bit word. Keeping the pixel dimension
+// intact gives BRAM useful depth instead of creating one shallow RAM per pixel.
 #pragma HLS ARRAY_RESHAPE variable = accum cyclic \
     factor = kOutputParallel dim = 1
-#pragma HLS ARRAY_PARTITION variable = accum complete dim = 2
-#pragma HLS BIND_STORAGE variable = accum type = ram_2p impl = lutram
+#pragma HLS BIND_STORAGE variable = accum type = ram_2p impl = bram
 
-      InitAccumPixelLoop:
-        for (int pixel = 0; pixel < kPixelTile; ++pixel) {
+      InitAccumOutputGroupLoop:
+        for (int output_base = 0; output_base < kOutputBlock;
+             output_base += kOutputParallel) {
+        InitAccumPixelLoop:
+          for (int pixel = 0; pixel < kPixelTile; ++pixel) {
 #pragma HLS PIPELINE II = 1
-        InitAccumOutputLoop:
-          for (int local_m = 0; local_m < kOutputBlock; ++local_m) {
+          InitAccumLaneLoop:
+            for (int output_lane = 0; output_lane < kOutputParallel;
+                 ++output_lane) {
 #pragma HLS UNROLL
-            accum[local_m][pixel] = 0;
+              accum[output_base + output_lane][pixel] = 0;
+            }
           }
         }
 

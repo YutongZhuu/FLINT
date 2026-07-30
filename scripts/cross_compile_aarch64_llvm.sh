@@ -18,6 +18,8 @@ target_lib_dir=${AARCH64_TARGET_LIB_DIR:-$sysroot/usr/lib/aarch64-linux-gnu}
 omp_lib_dir=${AARCH64_OMP_LIB_DIR:-$sysroot/usr/lib/llvm-14/lib}
 myaccel_use_xrt=${MYACCEL_USE_XRT:-0}
 disable_recompose=${ONNX_MLIR_DISABLE_RECOMPOSE:-0}
+profile_ir=${ONNX_MLIR_PROFILE_IR:-0}
+skip_model_compile=${AARCH64_SKIP_MODEL_COMPILE:-0}
 
 if [ -z "$sysroot" ]; then
   cat >&2 <<'EOF'
@@ -61,7 +63,8 @@ if [ -z "$lld" ]; then
 fi
 linker_flag="-fuse-ld=$lld"
 
-if ! command -v "$onnx_mlir" >/dev/null 2>&1; then
+if [ "$skip_model_compile" != "1" ] &&
+  ! command -v "$onnx_mlir" >/dev/null 2>&1; then
   cat >&2 <<EOF
 error: cannot find ONNX_MLIR_BIN '$onnx_mlir'.
 
@@ -102,7 +105,11 @@ if [ "$myaccel_use_xrt" = "1" ]; then
   xrt_lib_dir=${AARCH64_XRT_LIB_DIR:-}
 
   if [ -z "$xrt_include_dir" ] && [ -n "$xrt_root" ]; then
-    xrt_include_dir="$xrt_root/include"
+    if [ -f "$xrt_root/include/xrt/xrt/xrt_bo.h" ]; then
+      xrt_include_dir="$xrt_root/include/xrt"
+    else
+      xrt_include_dir="$xrt_root/include"
+    fi
   fi
   if [ -z "$xrt_lib_dir" ] && [ -n "$xrt_root" ]; then
     xrt_lib_dir="$xrt_root/lib"
@@ -146,7 +153,8 @@ EOF
   fi
 
   xrt_compile_flags=(-DMYACCEL_USE_XRT -I"$xrt_include_dir")
-  xrt_link_flags=(-L"$xrt_lib_dir" -lxrt_coreutil -pthread)
+  xrt_link_flags=(-L"$xrt_lib_dir" '-Wl,-rpath,$ORIGIN/runtime-libs'
+    -lxrt_coreutil -pthread)
 fi
 
 mkdir -p build/aarch64
@@ -158,18 +166,28 @@ if [ "$disable_recompose" = "1" ]; then
   # new FP32 Conv operations, which no longer match the INT8 rewrite.
   onnx_mlir_graph_flags+=(--disable-recompose)
 fi
+if [ "$profile_ir" = "1" ]; then
+  onnx_mlir_graph_flags+=(--profile-ir=Onnx)
+fi
 
-"$onnx_mlir" \
-  --maccel=MyAccel \
-  "${onnx_mlir_graph_flags[@]}" \
-  --mtriple="$target" \
-  --mcpu=cortex-a53 \
-  --parallel \
-  --simd-data-layout \
-  --EmitObj \
-  "-O$opt_level" \
-  -o "$out_base" \
-  "$model"
+if [ "$skip_model_compile" = "1" ]; then
+  if [ ! -f "$out_base.o" ]; then
+    echo "error: model compilation was skipped but $out_base.o is missing" >&2
+    exit 2
+  fi
+else
+  "$onnx_mlir" \
+    --maccel=MyAccel \
+    "${onnx_mlir_graph_flags[@]}" \
+    --mtriple="$target" \
+    --mcpu=cortex-a53 \
+    --parallel \
+    --simd-data-layout \
+    --EmitObj \
+    "-O$opt_level" \
+    -o "$out_base" \
+    "$model"
+fi
 
 runtime_sources=(
   third_party/onnx-mlir/src/Runtime/OMTensor.c
@@ -199,6 +217,7 @@ for src in "${runtime_sources[@]}"; do
     -Ithird_party/onnx-mlir \
     -Ithird_party/onnx-mlir/src/Runtime \
     -Ithird_party/onnx-mlir/src/Accelerators/MyAccel/Runtime \
+    -Ihw/hls \
     -c "$src" -o "$obj"
   runtime_objects+=("$obj")
 done
@@ -208,17 +227,28 @@ myaccel_xrt_obj="build/aarch64/MyAccelXrt.o"
   --gcc-toolchain="$gcc_toolchain" -B"$gcc_lib_dir" -B"$target_lib_dir" \
   -std=c++17 -O3 -fPIC -Wno-unknown-pragmas \
   -Ithird_party/onnx-mlir/src/Accelerators/MyAccel/Runtime \
+  -Ihw/hls \
   ${xrt_compile_flags[@]+"${xrt_compile_flags[@]}"} \
   -c third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime/MyAccelXrt.cpp -o "$myaccel_xrt_obj"
 runtime_objects+=("$myaccel_xrt_obj")
+
+shared_libm=$sysroot/lib/aarch64-linux-gnu/libm.so.6
+if [ ! -f "$shared_libm" ]; then
+  echo "error: target shared libm was not found: $shared_libm" >&2
+  exit 2
+fi
 
 "$clangxx" --target="$target" --sysroot="$sysroot" \
   --gcc-toolchain="$gcc_toolchain" -B"$gcc_lib_dir" -B"$target_lib_dir" \
   -shared -fPIC \
   "$out_base.o" "${runtime_objects[@]}" \
   "$linker_flag" \
-  -L"$omp_lib_dir" -Wl,-rpath-link,"$omp_lib_dir" -lomp -lm \
+  -L"$omp_lib_dir" \
+  -Wl,-rpath-link,"$omp_lib_dir" \
+  -Wl,-rpath-link,"$target_lib_dir" \
+  -lomp \
   ${xrt_link_flags[@]+"${xrt_link_flags[@]}"} \
+  -Wl,--no-as-needed "$shared_libm" -Wl,--as-needed \
   -o "$out_base.so"
 
 "$clangxx" --target="$target" --sysroot="$sysroot" \
@@ -226,8 +256,11 @@ runtime_objects+=("$myaccel_xrt_obj")
   -std=c++17 -O2 "$linker_flag" \
   -Ithird_party/onnx-mlir/include \
   -Ithird_party/onnx-mlir \
-  driver/yolo_driver.cpp "$out_base.so" \
+  driver/yolo_driver.cpp \
+  -L"$(dirname "$out_base.so")" \
+  "-l:$(basename "$out_base.so")" \
   -Wl,-rpath,'$ORIGIN' \
+  -Wl,--no-as-needed "$shared_libm" -Wl,--as-needed \
   -o "$driver_out"
 
 file "$out_base.o" "$out_base.so" "$driver_out"

@@ -11,6 +11,7 @@ ${CC:-clang} -std=c11 -O2 -D_GNU_SOURCE \
   -Ithird_party/onnx-mlir \
   -Ithird_party/onnx-mlir/src/Runtime \
   -Ithird_party/onnx-mlir/src/Accelerators/MyAccel/Runtime \
+  -Ihw/hls \
   tests/myaccel/qdq_conv_runtime_test.c \
   third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime/MyConv.c \
   third_party/onnx-mlir/src/Runtime/OMTensor.c \
