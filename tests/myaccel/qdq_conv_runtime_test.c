@@ -161,7 +161,7 @@ int main(void) {
   int8_t actual[6] = {0};
   const int8_t tiesExpected[6] = {0, 2, 0, -2, 64, -64};
   ok &= runCase("ties-to-even", x, xShape, w, wShape, bias, actual, yShape,
-      tiesExpected, 6, 0.5f, 0, 1.0f, 0, 0.5f, 0, 1.0f, 0, 0, 1, 1);
+      tiesExpected, 6, 0.5f, 0, 1.0f, 0, 0.5f, 0, 1.0f, 0, 0, 1, 0);
 
   int8_t shiftedX[6] = {2, 4, 0, -2, 2, 4};
   int8_t shiftedW[1] = {-1};
@@ -170,18 +170,38 @@ int main(void) {
   memset(actual, 0, sizeof(actual));
   ok &= runCase("zero-points-and-bias", shiftedX, xShape, shiftedW, wShape,
       shiftedBias, actual, yShape, shiftedExpected, 6, 0.5f, 1, 1.0f, -2,
-      0.5f, 0, 1.0f, 5, 0, 1, 1);
+      0.5f, 0, 1.0f, 5, 0, 1, 0);
 
-  const int8_t generalBiasExpected[6] = {1, 2, 0, -1, 64, -64};
-  memset(actual, 0, sizeof(actual));
-  ok &= runCase("mismatched-bias-scale-host-fallback", x, xShape, w,
-      wShape, shiftedBias, actual, yShape, generalBiasExpected, 6, 0.5f, 0,
-      1.0f, 0, 0.25f, 0, 1.0f, 0, 0, 1, 0);
+  int64_t alignedOneByOneXShape[4] = {1, 4, 1, 4};
+  int64_t alignedOneByOneWShape[4] = {1, 4, 1, 1};
+  int64_t alignedOneByOneYShape[4] = {1, 1, 1, 4};
+  int8_t alignedOneByOneX[16] = {
+      1, 2, 3, 4, 5, 6, 7, 8, -1, -2, -3, -4, 2, 2, 2, 2};
+  int8_t alignedOneByOneW[4] = {1, -1, 2, 3};
+  int32_t alignedOneByOneBias[1] = {1};
+  int8_t alignedOneByOneActual[4] = {0};
+  const int8_t alignedOneByOneExpected[4] = {1, -1, -3, -5};
+  ok &= runCase("1x1-packed-hardware-dispatch", alignedOneByOneX,
+      alignedOneByOneXShape, alignedOneByOneW, alignedOneByOneWShape,
+      alignedOneByOneBias, alignedOneByOneActual, alignedOneByOneYShape,
+      alignedOneByOneExpected, 4, 1.0f, 0, 1.0f, 0, 1.0f, 0, 1.0f, 0,
+      0, 1, 1);
 
-  memset(actual, 0, sizeof(actual));
-  ok &= runCase("nonzero-bias-zero-point-host-fallback", x, xShape, w,
-      wShape, shiftedBias, actual, yShape, generalBiasExpected, 6, 0.5f, 0,
-      1.0f, 0, 0.5f, 1, 1.0f, 0, 0, 1, 0);
+  const int8_t mismatchedBiasExpected[4] = {1, -1, -3, -5};
+  memset(alignedOneByOneActual, 0, sizeof(alignedOneByOneActual));
+  ok &= runCase("mismatched-bias-scale-host-fallback", alignedOneByOneX,
+      alignedOneByOneXShape, alignedOneByOneW, alignedOneByOneWShape,
+      alignedOneByOneBias, alignedOneByOneActual, alignedOneByOneYShape,
+      mismatchedBiasExpected, 4, 1.0f, 0, 1.0f, 0, 0.75f, 0, 1.0f, 0,
+      0, 1, 0);
+
+  const int8_t nonzeroBiasZeroPointExpected[4] = {2, 0, -2, -4};
+  memset(alignedOneByOneActual, 0, sizeof(alignedOneByOneActual));
+  ok &= runCase("nonzero-bias-zero-point-host-fallback", alignedOneByOneX,
+      alignedOneByOneXShape, alignedOneByOneW, alignedOneByOneWShape,
+      alignedOneByOneBias, alignedOneByOneActual, alignedOneByOneYShape,
+      nonzeroBiasZeroPointExpected, 4, 1.0f, 0, 1.0f, 0, 1.0f, -1, 1.0f,
+      0, 0, 1, 0);
 
   int64_t satXShape[4] = {1, 1, 1, 2};
   int64_t satYShape[4] = {1, 1, 1, 2};
@@ -190,7 +210,7 @@ int main(void) {
   const int8_t satExpected[2] = {127, -128};
   ok &= runCase("signed-saturation", satX, satXShape, w, wShape, bias,
       satActual, satYShape, satExpected, 2, 2.0f, 0, 1.0f, 0, 2.0f, 0,
-      0.01f, 0, 0, 1, 1);
+      0.01f, 0, 0, 1, 0);
 
   int64_t imageShape[4] = {1, 1, 3, 3};
   int64_t kernelShape[4] = {1, 1, 3, 3};
@@ -200,7 +220,46 @@ int main(void) {
   const int8_t imageExpected[9] = {4, 6, 4, 6, 9, 6, 4, 6, 4};
   ok &= runCase("3x3-im2col-padding", image, imageShape, kernel, kernelShape,
       bias, imageActual, imageShape, imageExpected, 9, 1.0f, 0, 1.0f, 0,
-      1.0f, 0, 1.0f, 0, 1, 1, 1);
+      1.0f, 0, 1.0f, 0, 1, 1, 0);
+
+  int64_t alignedThreeByThreeXShape[4] = {1, 4, 3, 4};
+  int64_t alignedThreeByThreeWShape[4] = {1, 4, 3, 3};
+  int64_t alignedThreeByThreeYShape[4] = {1, 1, 3, 4};
+  int8_t alignedThreeByThreeX[48];
+  int8_t alignedThreeByThreeW[36];
+  memset(alignedThreeByThreeX, 1, sizeof(alignedThreeByThreeX));
+  memset(alignedThreeByThreeW, 1, sizeof(alignedThreeByThreeW));
+  int8_t alignedThreeByThreeActual[12] = {0};
+  const int8_t alignedThreeByThreeExpected[12] = {
+      16, 24, 24, 16, 24, 36, 36, 24, 16, 24, 24, 16};
+  ok &= runCase("3x3-packed-hardware-dispatch", alignedThreeByThreeX,
+      alignedThreeByThreeXShape, alignedThreeByThreeW,
+      alignedThreeByThreeWShape, bias, alignedThreeByThreeActual,
+      alignedThreeByThreeYShape, alignedThreeByThreeExpected, 12, 1.0f, 0,
+      1.0f, 0, 1.0f, 0, 1.0f, 0, 1, 1, 1);
+
+  int64_t packedStemXShape[4] = {1, 3, 8, 8};
+  int64_t packedStemWShape[4] = {1, 3, 6, 6};
+  int64_t packedStemYShape[4] = {1, 1, 4, 4};
+  int8_t packedStemX[192];
+  int8_t packedStemW[108];
+  memset(packedStemX, 1, sizeof(packedStemX));
+  memset(packedStemW, 1, sizeof(packedStemW));
+  int8_t packedStemActual[16] = {0};
+  const int8_t packedStemExpected[16] = {
+      48, 72, 72, 48, 72, 108, 108, 72,
+      72, 108, 108, 72, 48, 72, 72, 48};
+  ok &= runCase("6x6-stem-disabled-host-fallback", packedStemX,
+      packedStemXShape, packedStemW, packedStemWShape, bias,
+      packedStemActual, packedStemYShape, packedStemExpected, 16, 1.0f, 0,
+      1.0f, 0, 1.0f, 0, 1.0f, 0, 2, 2, 0);
+  memset(packedStemActual, 0, sizeof(packedStemActual));
+  setenv("MYACCEL_ENABLE_6X6_STEM", "1", 1);
+  ok &= runCase("6x6-stem-packed-hardware-dispatch", packedStemX,
+      packedStemXShape, packedStemW, packedStemWShape, bias,
+      packedStemActual, packedStemYShape, packedStemExpected, 16, 1.0f, 0,
+      1.0f, 0, 1.0f, 0, 1.0f, 0, 2, 2, 1);
+  unsetenv("MYACCEL_ENABLE_6X6_STEM");
 
   int64_t sixBySixInputShape[4] = {1, 1, 6, 6};
   int64_t sixBySixWeightShape[4] = {1, 1, 6, 6};

@@ -14,6 +14,10 @@ constexpr int kOutputParallel = 8;
 constexpr int kOutputBlock = 16;
 constexpr int kOutputTileHeight = 2;
 constexpr int kOutputTileWidth = 8;
+constexpr int kPackedBytes = 4;
+constexpr int kKernelElements = 3 * 3;
+constexpr int kWeightWordsPerInputGroup =
+    kInputParallel * kKernelElements / kPackedBytes;
 constexpr int kInputTileHeight =
     (kOutputTileHeight - 1) * MYACCEL_CONV3X3_INT8_MAX_STRIDE + 3;
 constexpr int kInputTileWidth =
@@ -31,6 +35,20 @@ static int32_t dspMultiply(centered_t lhs, centered_t rhs) {
 #pragma HLS BIND_OP variable = product op = mul impl = dsp
   product = lhs * rhs;
   return product;
+}
+
+static int8_t unpackInt8(uint32_t word, int byte_lane) {
+#pragma HLS INLINE
+  return (int8_t)((word >> (byte_lane * 8)) & 0xffU);
+}
+
+static uint32_t packInt8(const int8_t bytes[kPackedBytes]) {
+#pragma HLS INLINE
+#pragma HLS ARRAY_PARTITION variable = bytes complete
+  return (uint32_t)(uint8_t)bytes[0] |
+         ((uint32_t)(uint8_t)bytes[1] << 8) |
+         ((uint32_t)(uint8_t)bytes[2] << 16) |
+         ((uint32_t)(uint8_t)bytes[3] << 24);
 }
 
 static int32_t reduce36(const int32_t value[36]) {
@@ -63,12 +81,12 @@ ReduceLevel2Loop:
 
 } // namespace
 
-extern "C" void conv3x3_i8_kernel(const int8_t *x, const int8_t *weight,
-    const int32_t *bias, int8_t *output, int n_size, int c_size, int h_size,
-    int input_w_size, int m_size, int oh_size, int ow_size, int pad_left,
-    int pad_top, int stride_h, int stride_w, int x_zero_point,
-    int w_zero_point, uint32_t requant_multiplier_bits,
-    int output_zero_point) {
+extern "C" void conv3x3_i8_kernel(const uint32_t *x,
+    const uint32_t *weight, const int32_t *bias, uint32_t *output,
+    int n_size, int c_size, int h_size, int input_w_size, int m_size,
+    int oh_size, int ow_size, int pad_left, int pad_top, int stride_h,
+    int stride_w, int x_zero_point, int w_zero_point,
+    uint32_t requant_multiplier_bits, int output_zero_point) {
 #pragma HLS INTERFACE m_axi port = x offset = slave bundle = gmem0 \
     max_read_burst_length = 64 num_read_outstanding = 16
 #pragma HLS INTERFACE m_axi port = weight offset = slave bundle = gmem1 \
@@ -101,6 +119,9 @@ extern "C" void conv3x3_i8_kernel(const int8_t *x, const int8_t *weight,
   if (!x || !weight || !bias || !output || n_size <= 0 || c_size <= 0 ||
       c_size > MYACCEL_CONV3X3_INT8_MAX_INPUT_CHANNELS || h_size <= 0 ||
       input_w_size <= 0 || m_size <= 0 || oh_size <= 0 || ow_size <= 0 ||
+      (c_size & (kPackedBytes - 1)) != 0 ||
+      (input_w_size & (kPackedBytes - 1)) != 0 ||
+      (ow_size & (kPackedBytes - 1)) != 0 ||
       stride_h <= 0 || stride_h > MYACCEL_CONV3X3_INT8_MAX_STRIDE ||
       stride_w <= 0 || stride_w > MYACCEL_CONV3X3_INT8_MAX_STRIDE ||
       !myaccel_int8::isPositiveNormalMultiplier(requant_multiplier_bits))
@@ -108,17 +129,18 @@ extern "C" void conv3x3_i8_kernel(const int8_t *x, const int8_t *weight,
 
 OutputBlockLoop:
   for (int m_block = 0; m_block < m_size; m_block += kOutputBlock) {
-    centered_t weight_cache[kOutputBlock]
-                             [MYACCEL_CONV3X3_INT8_MAX_INPUT_CHANNELS][3][3];
+    uint32_t weight_cache[kOutputBlock]
+                         [MYACCEL_CONV3X3_INT8_MAX_INPUT_CHANNELS /
+                             kInputParallel]
+                         [kWeightWordsPerInputGroup];
     int32_t bias_cache[kOutputBlock];
 #pragma HLS ARRAY_RESHAPE variable = weight_cache cyclic \
     factor = kOutputParallel dim = 1
-#pragma HLS ARRAY_RESHAPE variable = weight_cache cyclic \
-    factor = kInputParallel dim = 2
 #pragma HLS ARRAY_PARTITION variable = weight_cache complete dim = 3
-#pragma HLS ARRAY_PARTITION variable = weight_cache complete dim = 4
-// The nine independently-read tap planes use URAM so their 2,592-bit/cycle
-// aggregate bandwidth does not consume distributed LUT RAM.
+// Four input channels contain 36 OIHW bytes, exactly nine aligned words. Keep
+// those nine words in independently-read URAM planes. Reshaping eight output
+// lanes supplies 2,304 raw weight bits per cycle; the unrolled compute lanes
+// center the resulting 72 INT8 operands without a preload byte-scatter mux.
 #pragma HLS BIND_STORAGE variable = weight_cache type = ram_2p impl = uram
 #pragma HLS ARRAY_PARTITION variable = bias_cache complete
 
@@ -132,26 +154,22 @@ OutputBlockLoop:
   LoadWeightOutputLoop:
     for (int local_m = 0; local_m < kOutputBlock; ++local_m) {
       const int m = m_block + local_m;
-    LoadWeightChannelLoop:
-      for (int c = 0; c < c_size; ++c) {
-      LoadWeightRowLoop:
-        for (int kh = 0; kh < 3; ++kh) {
-        LoadWeightColumnLoop:
-          for (int kw = 0; kw < 3; ++kw) {
+    LoadWeightInputGroupLoop:
+      for (int input_group = 0; input_group < c_size / kInputParallel;
+           ++input_group) {
+      LoadWeightWordLoop:
+        for (int word_in_group = 0;
+             word_in_group < kWeightWordsPerInputGroup; ++word_in_group) {
 #pragma HLS PIPELINE II = 1
-// Every flattened loop iteration writes a distinct OIHW cache element. Vitis
-// otherwise infers a false loop-carried read/write dependence on weight_cache
-// and schedules this preload at II=2.
 #pragma HLS DEPENDENCE variable = weight_cache inter false
-            if (m < m_size) {
-              const uint32_t weight_index =
-                  (((uint32_t)m * c_size + c) * 3 + kh) * 3 + kw;
-              weight_cache[local_m][c][kh][kw] =
-                  (centered_t)((int32_t)weight[weight_index] - w_zero_point);
-            } else {
-              weight_cache[local_m][c][kh][kw] = 0;
-            }
-          }
+          const uint32_t output_word_base =
+              (uint32_t)m * c_size * kKernelElements / kPackedBytes;
+          weight_cache[local_m][input_group][word_in_group] =
+              m < m_size
+                  ? weight[output_word_base +
+                           input_group * kWeightWordsPerInputGroup +
+                           word_in_group]
+                  : 0;
         }
       }
     }
@@ -217,22 +235,81 @@ OutputBlockLoop:
             LoadInputRowLoop:
               for (int local_ih = 0; local_ih < kInputTileHeight;
                    ++local_ih) {
-              LoadInputColumnLoop:
-                for (int local_iw = 0; local_iw < kInputTileWidth;
-                     ++local_iw) {
+              LoadInputWordGroupLoop:
+                for (int local_iw_base = 0;
+                     local_iw_base < kInputTileWidth;
+                     local_iw_base += kPackedBytes) {
 #pragma HLS PIPELINE II = 1
                   const int ih = input_row_base + local_ih;
-                  const int iw = input_column_base + local_iw;
-                  if (c < c_size && local_ih < patch_height &&
-                      local_iw < patch_width && ih >= 0 && ih < h_size &&
-                      iw >= 0 && iw < input_w_size) {
-                    const uint32_t x_index =
+                  const int group_first_iw =
+                      input_column_base + local_iw_base;
+                  const int remaining_patch_columns =
+                      patch_width - local_iw_base;
+                  const int active_group_bytes =
+                      remaining_patch_columns <= 0
+                          ? 0
+                          : (remaining_patch_columns < kPackedBytes
+                                    ? remaining_patch_columns
+                                    : kPackedBytes);
+                  const int group_last_iw =
+                      group_first_iw + active_group_bytes - 1;
+                  const int valid_first_iw =
+                      group_first_iw < 0 ? 0 : group_first_iw;
+                  const int valid_last_iw = group_last_iw >= input_w_size
+                                                ? input_w_size - 1
+                                                : group_last_iw;
+                  const bool valid_row = c < c_size &&
+                                         local_ih < patch_height && ih >= 0 &&
+                                         ih < h_size;
+                  const bool has_valid_columns =
+                      active_group_bytes > 0 &&
+                      valid_first_iw <= valid_last_iw &&
+                      valid_first_iw < input_w_size && valid_last_iw >= 0;
+
+                  uint32_t first_word = 0;
+                  uint32_t second_word = 0;
+                  int first_word_column = 0;
+                  int second_word_column = 0;
+                  if (valid_row && has_valid_columns) {
+                    first_word_column = valid_first_iw & ~(kPackedBytes - 1);
+                    second_word_column = valid_last_iw & ~(kPackedBytes - 1);
+                    const uint32_t row_byte_index =
                         ((uint32_t)n * c_size + c) * h_size * input_w_size +
-                        (uint32_t)ih * input_w_size + iw;
-                    input_tile[input_lane][local_ih][local_iw] =
-                        (centered_t)((int32_t)x[x_index] - x_zero_point);
-                  } else {
-                    input_tile[input_lane][local_ih][local_iw] = 0;
+                        (uint32_t)ih * input_w_size;
+                    const uint32_t row_word_index =
+                        row_byte_index / kPackedBytes;
+                    first_word =
+                        x[row_word_index + first_word_column / kPackedBytes];
+                    second_word =
+                        second_word_column == first_word_column
+                            ? first_word
+                            : x[row_word_index +
+                                second_word_column / kPackedBytes];
+                  }
+
+                ScatterInputByteLoop:
+                  for (int byte_lane = 0; byte_lane < kPackedBytes;
+                       ++byte_lane) {
+#pragma HLS UNROLL
+                    const int local_iw = local_iw_base + byte_lane;
+                    const int iw = group_first_iw + byte_lane;
+                    if (local_iw < kInputTileWidth) {
+                      if (valid_row && local_iw < patch_width && iw >= 0 &&
+                          iw < input_w_size) {
+                        const int word_column =
+                            iw & ~(kPackedBytes - 1);
+                        const uint32_t packed_input =
+                            word_column == first_word_column ? first_word
+                                                             : second_word;
+                        input_tile[input_lane][local_ih][local_iw] =
+                            (centered_t)((int32_t)unpackInt8(
+                                             packed_input,
+                                             iw & (kPackedBytes - 1)) -
+                                         x_zero_point);
+                      } else {
+                        input_tile[input_lane][local_ih][local_iw] = 0;
+                      }
+                    }
                   }
                 }
               }
@@ -254,13 +331,22 @@ OutputBlockLoop:
                        output_lane < kOutputParallel; ++output_lane) {
 #pragma HLS UNROLL
                     const int local_m = output_base + output_lane;
+                    uint32_t packed_weights[kWeightWordsPerInputGroup];
                     int32_t products[kInputParallel * 3 * 3];
+#pragma HLS ARRAY_PARTITION variable = packed_weights complete
 #pragma HLS ARRAY_PARTITION variable = products complete
+                  ReadPackedWeightWordLoop:
+                    for (int word = 0;
+                         word < kWeightWordsPerInputGroup; ++word) {
+#pragma HLS UNROLL
+                      packed_weights[word] =
+                          weight_cache[local_m]
+                                      [c_base / kInputParallel][word];
+                    }
                   ProductInputLaneLoop:
                     for (int input_lane = 0;
                          input_lane < kInputParallel; ++input_lane) {
 #pragma HLS UNROLL
-                      const int c = c_base + input_lane;
                     ProductRowLoop:
                       for (int kh = 0; kh < 3; ++kh) {
 #pragma HLS UNROLL
@@ -269,9 +355,15 @@ OutputBlockLoop:
 #pragma HLS UNROLL
                           const int product_index =
                               (input_lane * 3 + kh) * 3 + kw;
+                          const int packed_word = product_index / kPackedBytes;
+                          const int packed_byte =
+                              product_index & (kPackedBytes - 1);
                           const centered_t weight_value =
-                              c < c_size
-                                  ? weight_cache[local_m][c][kh][kw]
+                              m_block + local_m < m_size
+                                  ? (centered_t)((int32_t)unpackInt8(
+                                                     packed_weights[packed_word],
+                                                     packed_byte) -
+                                                 w_zero_point)
                                   : centered_t(0);
                           const int local_ih = local_oh * stride_h + kh;
                           const int local_iw = local_ow * stride_w + kw;
@@ -296,19 +388,29 @@ OutputBlockLoop:
           StoreOutputRowLoop:
             for (int local_oh = 0; local_oh < kOutputTileHeight; ++local_oh) {
               const int oh = oh_base + local_oh;
+              int8_t output_bytes[kPackedBytes];
+#pragma HLS ARRAY_PARTITION variable = output_bytes complete
             StoreOutputColumnLoop:
               for (int local_ow = 0; local_ow < kOutputTileWidth;
                    ++local_ow) {
 #pragma HLS PIPELINE II = 1
                 const int ow = ow_base + local_ow;
                 if (m < m_size && oh < oh_size && ow < ow_size) {
-                  const uint32_t output_index =
-                      ((uint32_t)n * m_size + m) * oh_size * ow_size +
-                      (uint32_t)oh * ow_size + ow;
-                  output[output_index] = myaccel_int8::requantize(
+                  const int byte_lane = local_ow & (kPackedBytes - 1);
+                  output_bytes[byte_lane] = myaccel_int8::requantize(
                       accum[local_m][local_oh][local_ow],
                       bias_cache[local_m], requant_multiplier_bits,
                       output_zero_point);
+                  // ow_size and the eight-column tile are word aligned. Emit
+                  // one packed AXI word after four scalar requantizer cycles.
+                  if (byte_lane == kPackedBytes - 1) {
+                    const uint32_t output_byte_index =
+                        ((uint32_t)n * m_size + m) * oh_size * ow_size +
+                        (uint32_t)oh * ow_size + ow -
+                        (kPackedBytes - 1);
+                    output[output_byte_index / kPackedBytes] =
+                        packInt8(output_bytes);
+                  }
                 }
               }
             }

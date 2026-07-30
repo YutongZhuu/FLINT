@@ -39,7 +39,6 @@ temporary_dir=$(mktemp -d)
 trap 'rm -rf "$temporary_dir"' EXIT
 
 raw_bit="$temporary_dir/$app_name.bit"
-bootgen_bif="$temporary_dir/$app_name.bif"
 dtbo_dts="$temporary_dir/$app_name.dts"
 
 dtc -I dtb -O dts -o "$dtbo_dts" "$dtbo_input"
@@ -66,20 +65,24 @@ xclbinutil \
   --dump-section "BITSTREAM:RAW:$raw_bit" \
   --input "$xclbin_input"
 
-cat >"$bootgen_bif" <<EOF
-all:
-{
-  [destination_device = pl] $raw_bit
-}
-EOF
-
 mkdir -p "$output_dir"
 
-bootgen \
-  -image "$bootgen_bif" \
-  -arch zynqmp \
-  -o "$output_dir/$app_name.bit.bin" \
-  -w
+(
+  cd "$temporary_dir"
+  printf 'all:{%s}\n' "$app_name.bit" >"$app_name.bif"
+  bootgen \
+    -w \
+    -arch zynqmp \
+    -process_bitstream bin \
+    -image "$app_name.bif"
+)
+
+generated_bit_bin=$raw_bit.bin
+if [ ! -s "$generated_bit_bin" ]; then
+  echo "error: bootgen did not produce $generated_bit_bin" >&2
+  exit 1
+fi
+cp "$generated_bit_bin" "$output_dir/$app_name.bit.bin"
 
 cp "$dtbo_input" "$output_dir/$app_name.dtbo"
 cp "$xclbin_input" "$output_dir/$app_name.xclbin"

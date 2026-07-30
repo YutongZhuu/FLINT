@@ -94,6 +94,7 @@ set -euo pipefail
 
 output=
 image=
+process_bitstream=
 while [ $# -gt 0 ]; do
   case "$1" in
   -o)
@@ -104,9 +105,14 @@ while [ $# -gt 0 ]; do
     image=$2
     shift 2
     ;;
+  -process_bitstream)
+    process_bitstream=$2
+    shift 2
+    ;;
   *) shift ;;
   esac
 done
+test "$process_bitstream" = bin
 if [ -z "$output" ]; then
   test -n "$image"
   bit_file=$(sed -n 's/^all:{\(.*\)}$/\1/p' "$image")
@@ -179,12 +185,14 @@ PATH="$mock_bin:$PATH" \
 PLATFORM="$test_root/platform.xpfm" \
 TARGET=hw \
 VITIS_PROFILE=1 \
+VITIS_INCLUDE_6X6_STEM=1 \
 VITIS_OUT_DIR="$test_root/hw-out" \
 VITIS_REPORT_DIR="$test_root/hw-report" \
   ./hw/scripts/compile.sh >/dev/null
 
 test -s "$test_root/hw-report/conv1x1_i8_kernel_csynth.rpt"
 test -s "$test_root/hw-report/conv3x3_i8_kernel_csynth.rpt"
+test -s "$test_root/hw-report/conv6x6_stem_i8_kernel_csynth.rpt"
 test -s "$test_root/hw-report/timing_summary.rpt"
 test -s "$test_root/hw-report/utilization_hierarchical.rpt"
 test -s "$test_root/hw-out/conv_int8_only.hw.xsa"
@@ -202,6 +210,7 @@ VITIS_REPORT_DIR="$test_root/wrapper-report" \
   ./scripts/build_kv260_int8_only_xclbin.sh >/dev/null
 test -s "$test_root/wrapper-report/conv1x1_i8_kernel_csynth.rpt"
 test -s "$test_root/wrapper-report/conv3x3_i8_kernel_csynth.rpt"
+test ! -e "$test_root/wrapper-report/conv6x6_stem_i8_kernel_csynth.rpt"
 
 printf 'mock XCLBIN\n' >"$test_root/input.xclbin"
 printf 'firmware-name = "profile-app.bit.bin";\n' >"$test_root/matching.dtbo"
