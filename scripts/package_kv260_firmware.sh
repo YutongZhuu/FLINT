@@ -100,9 +100,17 @@ while read -r instance address; do
   if [ -z "$normalized_address" ]; then
     normalized_address=0
   fi
-  if ! grep -Eq \
-    "^[[:space:]]*${instance}[[:space:]]*=[[:space:]]*\"[^\"]*@${normalized_address}\";" \
-    "$dtbo_dts"; then
+  symbol_path=$(awk -v wanted="$instance" '
+    $1 == wanted && $2 == "=" {
+      path = $3
+      sub(/^"/, "", path)
+      sub(/";$/, "", path)
+      print path
+      exit
+    }
+  ' "$dtbo_dts")
+  if [[ -z "$symbol_path" ]] ||
+      [[ "$symbol_path" != *@"$normalized_address" ]]; then
     cat >&2 <<EOF
 error: DTBO does not contain the xclbin compute-unit address mapping.
   instance: $instance
@@ -114,37 +122,58 @@ EOF
     exit 2
   fi
   node_name=$(printf '%s' "$instance" | sed -E 's/_[0-9]+$//')
-  if ! awk -v node_name="$node_name" -v expected="$normalized_address" '
+  if ! awk -v target="$symbol_path" -v expected="$normalized_address" '
     function normalize_hex(value) {
       value = tolower(value)
       sub(/^0x/, "", value)
       sub(/^0+/, "", value)
       return value == "" ? "0" : value
     }
+    function current_path( path, i) {
+      path = ""
+      for (i = 1; i <= depth; ++i)
+        path = path "/" nodes[i]
+      return path == "" ? "/" : path
+    }
     {
+      raw_line = $0
       line = $0
-      if (!in_node &&
-          line ~ "^[[:space:]]*" node_name "@" expected \
-                  "[[:space:]]*\\{") {
-        in_node = 1
-        depth = 0
-      }
-      if (in_node) {
-        opened = gsub(/\{/, "{", line)
-        closed = gsub(/\}/, "}", line)
-        depth += opened - closed
+      sub(/^[[:space:]]*/, "", line)
 
-        reg_line = $0
-        if (reg_line ~ /^[[:space:]]*reg[[:space:]]*=/) {
-          sub(/^[^<]*</, "", reg_line)
-          sub(/>.*/, "", reg_line)
-          cell_count = split(reg_line, cells, /[[:space:]]+/)
-          if (cell_count >= 4 &&
-              normalize_hex(cells[2]) == expected)
-            found = 1
+      # Track the decompiled tree so the reg property must belong directly to
+      # the exact node referenced by __symbols__. Newer dtc versions may add a
+      # label prefix before the node name; strip it without accepting a decoy
+      # node elsewhere in the overlay or under __local_fixups__.
+      if (line ~ /\{[[:space:]]*$/ && line !~ /=/) {
+        sub(/[[:space:]]*\{[[:space:]]*$/, "", line)
+        sub(/^[A-Za-z_][A-Za-z0-9_]*:[[:space:]]+/, "", line)
+        if (line == "/") {
+          depth = 0
+        } else {
+          ++depth
+          nodes[depth] = line
+          if (current_path() == target)
+            target_depth = depth
         }
-        if (depth <= 0)
-          in_node = 0
+        next
+      }
+
+      if (target_depth > 0 && depth == target_depth &&
+          raw_line ~ /^[[:space:]]*reg[[:space:]]*=/) {
+        reg_line = raw_line
+        sub(/^[^<]*</, "", reg_line)
+        sub(/>.*/, "", reg_line)
+        cell_count = split(reg_line, cells, /[[:space:]]+/)
+        if (cell_count >= 4 && normalize_hex(cells[2]) == expected)
+          found = 1
+      }
+
+      if (line ~ /^\};/) {
+        if (target_depth > 0 && depth == target_depth)
+          target_depth = 0
+        delete nodes[depth]
+        if (depth > 0)
+          --depth
       }
     }
     END { exit(found ? 0 : 1) }

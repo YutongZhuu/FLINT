@@ -52,8 +52,7 @@ unset CPU
 unset MYACCEL_FORCE_CPU
 unset XCL_EMULATION_MODE
 
-mkdir -p "$(dirname "${profile_dir}")" "$(dirname "${output}")" \
-  "$(dirname "${log}")"
+mkdir -p "$(dirname "${profile_dir}")"
 if ! mkdir "${profile_dir}"; then
   cat >&2 <<EOF
 error: could not create fresh XRT profile output path: ${profile_dir}
@@ -63,6 +62,7 @@ cannot be accepted as evidence for the current invocation.
 EOF
   exit 1
 fi
+mkdir -p "$(dirname "${output}")" "$(dirname "${log}")"
 
 echo "XCLBIN: ${MYACCEL_XCLBIN}"
 echo "Input:  ${input}"

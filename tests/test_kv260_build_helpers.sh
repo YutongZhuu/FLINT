@@ -233,7 +233,7 @@ cat >"$KV260_DTG_OUT/pl.dtsi" <<'DTS'
   fragment@1 {
     target-path = "/axi";
     __overlay__ {
-      conv1x1_i8_kernel@a0010000 {
+      conv1x1_i8_kernel_1: conv1x1_i8_kernel@a0010000 {
         compatible = "xlnx,conv1x1-i8-kernel-1.0";
         reg = <0x0 0xa0010000 0x0 0x10000>;
       };
@@ -241,6 +241,15 @@ cat >"$KV260_DTG_OUT/pl.dtsi" <<'DTS'
   };
   __symbols__ {
     conv1x1_i8_kernel_1 = "/fragment@1/__overlay__/conv1x1_i8_kernel@a0010000";
+  };
+  __local_fixups__ {
+    fragment@1 {
+      __overlay__ {
+        conv1x1_i8_kernel@a0010000 {
+          reg = <0x0 0xa0010000 0x0 0x10000>;
+        };
+      };
+    };
   };
 };
 DTS
@@ -334,8 +343,16 @@ test -s "$test_root/firmware/profile-app/profile-app.dtbo"
 test -s "$test_root/firmware/profile-app/profile-app.xclbin"
 test -s "$test_root/firmware/profile-app/shell.json"
 
-sed 's/0xa0010000/0xa0090000/g' \
-  "$test_root/matching.dtbo" >"$test_root/wrong-address.dtbo"
+awk '
+  !changed && /conv1x1_i8_kernel_1: conv1x1_i8_kernel@a0010000/ {
+    in_target = 1
+  }
+  in_target && !changed && /reg[[:space:]]*=/ {
+    sub(/0xa0010000/, "0xa0090000")
+    changed = 1
+  }
+  { print }
+' "$test_root/matching.dtbo" >"$test_root/wrong-address.dtbo"
 if PATH="$mock_bin:$PATH" \
   KV260_APP_NAME=profile-app \
   ./scripts/package_kv260_firmware.sh \
@@ -417,6 +434,25 @@ test -s "$test_root/xrt-output/xrt.run_summary"
 test -s "$test_root/xrt-output/summary.csv"
 test -s "$test_root/xrt-output/native_trace.csv"
 test -s "$test_root/xrt-output/device_trace_0.csv"
+
+# Output and log paths are allowed inside the freshly and atomically created
+# profile directory. Their parent directories must be created only after the
+# profile leaf itself has been claimed.
+contained_profile="$test_root/xrt-output-contained"
+(
+  cd "$test_root"
+  MYACCEL_XCLBIN="$profile_package/profile.xclbin" \
+  MYACCEL_XRT_PROFILE_DIR="$contained_profile" \
+  MYACCEL_XRT_INI="$profile_package/xrt-profile.ini" \
+  TIME_BIN="$mock_bin/time" \
+    "$profile_package/run-profile.sh" \
+      "$profile_package/input.bin" \
+      "$contained_profile/results/output.bin" \
+      "$contained_profile/logs/profile.log" >/dev/null
+)
+test -s "$contained_profile/results/output.bin"
+test -s "$contained_profile/logs/profile.log"
+test -s "$contained_profile/xrt.run_summary"
 
 if (
   cd "$test_root"
