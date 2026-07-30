@@ -112,7 +112,24 @@ fi
 runtime_lib_dir=$output_dir/runtime-libs
 mkdir -p "$runtime_lib_dir"
 cp "$xrt_root"/lib/libxrt_coreutil.so* "$runtime_lib_dir/"
-cp "$target_lib_dir/libboost_filesystem.so.1.74.0" "$runtime_lib_dir/"
+
+# libxrt_coreutil depends on Boost.Filesystem on XRT 2.13. Some minimal
+# cross-sysroots omit it even though the KV260 image provides it. Package a
+# sysroot/toolchain copy when available, but do not discard an otherwise valid
+# AArch64 host-test binary solely because this optional bundle dependency is
+# absent.
+boost_filesystem=${AARCH64_BOOST_FILESYSTEM_LIB:-}
+if [ -z "$boost_filesystem" ]; then
+  boost_filesystem=$(find "$target_lib_dir" "$xrt_root/lib" \
+    -maxdepth 1 \( -type f -o -type l \) \
+    -name 'libboost_filesystem.so*' -print -quit 2>/dev/null || true)
+fi
+if [ -n "$boost_filesystem" ]; then
+  cp -L "$boost_filesystem" "$runtime_lib_dir/"
+else
+  echo "warning: Boost.Filesystem is not in the cross-sysroot; " \
+    "the target image must provide libboost_filesystem.so" >&2
+fi
 cp -L "$target_lib_dir/libuuid.so.1" "$runtime_lib_dir/"
 tar -czf "$archive" \
   -C "$output_dir" \
