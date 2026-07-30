@@ -16,6 +16,13 @@ Run the ordinary C++ numerical models for all HLS kernels:
 ./scripts/test_myaccel_hls_kernels.sh
 ```
 
+Run the mocked KV260 build, firmware, and XRT profiling helper tests (Vitis is
+not required):
+
+```bash
+./tests/test_kv260_build_helpers.sh
+```
+
 Verify that the YOLOv5n INT8 model lowers to 60 fused INT8 convolution calls:
 
 ```bash

@@ -12,6 +12,9 @@ out_dir=${VITIS_OUT_DIR:-build}
 report_dir=${VITIS_REPORT_DIR:-report}
 platform=${PLATFORM:-${KV260_PLATFORM:-}}
 kernel_clock_hz=${KV260_KERNEL_CLOCK_HZ:-100000000}
+enable_profile=${VITIS_PROFILE:-0}
+compile_temp_root=$out_dir/vitis-compile
+compile_log_root=$out_dir/vitis-logs
 link_temp_dir=$out_dir/vitis-link
 
 case "$report_dir" in
@@ -20,6 +23,14 @@ case "$report_dir" in
 esac
 
 post_route_report_tcl=$hw_dir/scripts/post_route_reports.tcl
+
+case "$enable_profile" in
+0|1) ;;
+*)
+  echo "error: VITIS_PROFILE must be 0 or 1, got: $enable_profile" >&2
+  exit 2
+  ;;
+esac
 
 if [ -z "$platform" ]; then
   cat >&2 <<'EOF'
@@ -76,17 +87,61 @@ if [ ! -f "$post_route_report_tcl" ]; then
   exit 2
 fi
 
-mkdir -p "$out_dir" "$report_dir"
+conv1x1_temp_dir=$compile_temp_root/conv1x1_i8_kernel
+conv3x3_temp_dir=$compile_temp_root/conv3x3_i8_kernel
+conv1x1_vitis_report_dir=$report_dir/vitis/conv1x1_i8_kernel
+conv3x3_vitis_report_dir=$report_dir/vitis/conv3x3_i8_kernel
+conv1x1_log_dir=$compile_log_root/conv1x1_i8_kernel
+conv3x3_log_dir=$compile_log_root/conv3x3_i8_kernel
+link_report_dir=$report_dir/vitis/link
+link_log_dir=$compile_log_root/link
+
+mkdir -p \
+  "$out_dir" \
+  "$report_dir" \
+  "$conv1x1_temp_dir" \
+  "$conv3x3_temp_dir" \
+  "$conv1x1_vitis_report_dir" \
+  "$conv3x3_vitis_report_dir" \
+  "$conv1x1_log_dir" \
+  "$conv3x3_log_dir" \
+  "$link_report_dir" \
+  "$link_log_dir"
 
 conv1x1_xo="$out_dir/conv1x1_i8_kernel.$target.xo"
 conv3x3_xo="$out_dir/conv3x3_i8_kernel.$target.xo"
 xclbin="$out_dir/conv_int8_only.$target.xclbin"
+
+compile_profile_args=()
+link_profile_args=()
+link_export_args=()
+if [ "$enable_profile" = "1" ]; then
+  # Stall ports must be enabled while compiling each kernel. Data, stall, and
+  # execution monitors are then inserted while linking the system image.
+  compile_profile_args+=(--profile.stall all:all:all)
+  link_profile_args+=(
+    --profile.data all:all:all:all
+    --profile.stall all:all:all
+    --profile.exec all:all:all
+  )
+fi
+if [ "$target" = "hw" ]; then
+  # Keep the post-link XSA so the DTBO can be generated from the exact routed
+  # design rather than reused from an unrelated firmware application.
+  link_export_args+=(--advanced.param compiler.addOutputTypes=hw_export)
+fi
 
 v++ --compile \
   --target "$target" \
   --platform "$platform" \
   --kernel conv1x1_i8_kernel \
   --include "$kernel_dir" \
+  --report_level 2 \
+  --save-temps \
+  --temp_dir "$conv1x1_temp_dir" \
+  --report_dir "$conv1x1_vitis_report_dir" \
+  --log_dir "$conv1x1_log_dir" \
+  ${compile_profile_args[@]+"${compile_profile_args[@]}"} \
   "$conv1x1_src" \
   --output "$conv1x1_xo"
 
@@ -95,8 +150,45 @@ v++ --compile \
   --platform "$platform" \
   --kernel conv3x3_i8_kernel \
   --include "$kernel_dir" \
+  --report_level 2 \
+  --save-temps \
+  --temp_dir "$conv3x3_temp_dir" \
+  --report_dir "$conv3x3_vitis_report_dir" \
+  --log_dir "$conv3x3_log_dir" \
+  ${compile_profile_args[@]+"${compile_profile_args[@]}"} \
   "$conv3x3_src" \
   --output "$conv3x3_xo"
+
+copy_csynth_report() {
+  local kernel=$1
+  local vitis_report_dir=$2
+  local temp_dir=$3
+  local source_report=
+  local expected_report=
+
+  expected_report=$vitis_report_dir/$kernel.$target/hls_reports/${kernel}_csynth.rpt
+  if [ -s "$expected_report" ]; then
+    source_report=$expected_report
+  else
+    source_report=$(find "$vitis_report_dir" "$temp_dir" \
+      -type f -path "*/hls_reports/${kernel}_csynth.rpt" -print -quit)
+  fi
+  if [ -z "$source_report" ] || [ ! -s "$source_report" ]; then
+    echo "error: Vitis did not produce a non-empty ${kernel}_csynth.rpt" >&2
+    exit 1
+  fi
+
+  cp "$source_report" "$report_dir/${kernel}_csynth.rpt"
+  if [ ! -s "$report_dir/${kernel}_csynth.rpt" ]; then
+    echo "error: failed to collect $report_dir/${kernel}_csynth.rpt" >&2
+    exit 1
+  fi
+}
+
+copy_csynth_report \
+  conv1x1_i8_kernel "$conv1x1_vitis_report_dir" "$conv1x1_temp_dir"
+copy_csynth_report \
+  conv3x3_i8_kernel "$conv3x3_vitis_report_dir" "$conv3x3_temp_dir"
 
 v++ --link \
   --target "$target" \
@@ -105,14 +197,29 @@ v++ --link \
   --report_level 1 \
   --save-temps \
   --temp_dir "$link_temp_dir" \
+  --report_dir "$link_report_dir" \
+  --log_dir "$link_log_dir" \
+  ${link_profile_args[@]+"${link_profile_args[@]}"} \
+  ${link_export_args[@]+"${link_export_args[@]}"} \
   "$conv1x1_xo" \
   "$conv3x3_xo" \
   --output "$xclbin"
 
 printf '\nBuilt %s\n' "$xclbin"
 printf 'Linked kernels: conv1x1_i8_kernel, conv3x3_i8_kernel\n'
+printf 'HLS report: %s/conv1x1_i8_kernel_csynth.rpt\n' "$report_dir"
+printf 'HLS report: %s/conv3x3_i8_kernel_csynth.rpt\n' "$report_dir"
+if [ "$enable_profile" = "1" ]; then
+  printf 'XRT profiling instrumentation: data, stall, and execution\n'
+fi
 
 if [ "$target" = "hw" ]; then
+  xsa=${xclbin%.xclbin}.xsa
+  if [ ! -s "$xsa" ]; then
+    echo "error: Vitis did not produce the linked hardware export $xsa" >&2
+    exit 1
+  fi
+
   routed_checkpoint=$(
     find "$link_temp_dir" -type f -name '*_routed.dcp' -print -quit
   )
@@ -129,7 +236,10 @@ if [ "$target" = "hw" ]; then
     -source "$post_route_report_tcl" \
     -tclargs "$routed_checkpoint" "$report_dir"
 
-  for final_report in timing_summary.rpt utilization.rpt; do
+  for final_report in \
+    timing_summary.rpt \
+    utilization.rpt \
+    utilization_hierarchical.rpt; do
     if [ ! -s "$report_dir/$final_report" ]; then
       echo "error: Vivado did not produce $report_dir/$final_report" >&2
       exit 1
@@ -162,6 +272,9 @@ if [ "$target" = "hw" ]; then
     exit 1
   fi
   printf 'Built %s\n' "$bit_bin"
+  printf 'Linked hardware export: %s\n' "$xsa"
   printf 'Timing report: %s/timing_summary.rpt\n' "$report_dir"
   printf 'Utilization report: %s/utilization.rpt\n' "$report_dir"
+  printf 'Hierarchical utilization: %s/utilization_hierarchical.rpt\n' \
+    "$report_dir"
 fi

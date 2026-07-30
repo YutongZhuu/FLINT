@@ -18,5 +18,9 @@ report_timing_summary \
   -file [file join $report_dir timing_summary.rpt]
 report_utilization \
   -file [file join $report_dir utilization.rpt]
+report_utilization \
+  -hierarchical \
+  -hierarchical_depth 6 \
+  -file [file join $report_dir utilization_hierarchical.rpt]
 
 close_design
