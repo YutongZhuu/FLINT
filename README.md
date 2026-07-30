@@ -476,8 +476,11 @@ The 6x6 stem is a separate fit experiment and is enabled at build time with
 `MYACCEL_ENABLE_6X6_STEM=1`. Without both, the stem safely remains on the host.
 The INT8 runtime accepts output only when XRT reports
 `ERT_CMD_STATE_COMPLETED`. Other command states return to the CPU fallback;
-the default per-layer timeout is 30 seconds and can be changed with a positive
-`MYACCEL_XRT_RUN_TIMEOUT_MS` value.
+the default per-layer XRT wait threshold is 30 seconds and can be changed with
+a positive `MYACCEL_XRT_RUN_TIMEOUT_MS` value. XRT 2.13 can mask that threshold
+while other commands complete, and `abort()` is synchronous, so it is not a
+hard wall-clock deadline. If XRT cannot confirm a command is quiescent, the
+runtime quarantines the context and retains its BOs instead of risking reuse.
 
 Run the ordinary C++ numerical test before sending the sources to a Vitis
 machine:
@@ -679,13 +682,14 @@ XRT_INI_PATH=$PWD/scripts/xrt-profile.ini \
 ```
 
 Set `MYACCEL_XRT_PROFILE_DIR` to a new, nonexistent directory for each full
-profile. The runner rejects an existing path so stale summaries or traces
-cannot be accepted as evidence from a later invocation.
+profile. The runner atomically creates that directory and rejects a competing
+or existing path so stale/mixed summaries or traces cannot be accepted.
 
 Firmware packaging verifies more than the mutable `firmware-name`: every
-xclbin compute-unit instance/control address must also appear in the DTBO
-symbol map. A mismatch requires regenerating the overlay from the XSA exported
-by the same Vitis link.
+xclbin compute-unit instance/control address must appear both in the DTBO
+symbol path and in the referenced accelerator node's `reg` property. A
+mismatch requires regenerating the overlay from the XSA exported by the same
+Vitis link.
 
 `xdputil` inspects and benchmarks Vitis AI DPU/xmodel deployments. These are
 custom HLS/XRT kernels, so their scheduling evidence comes from HLS reports,

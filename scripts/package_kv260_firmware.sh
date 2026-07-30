@@ -113,6 +113,53 @@ Regenerate the DTBO from the XSA exported by the same Vitis link.
 EOF
     exit 2
   fi
+  node_name=$(printf '%s' "$instance" | sed -E 's/_[0-9]+$//')
+  if ! awk -v node_name="$node_name" -v expected="$normalized_address" '
+    function normalize_hex(value) {
+      value = tolower(value)
+      sub(/^0x/, "", value)
+      sub(/^0+/, "", value)
+      return value == "" ? "0" : value
+    }
+    {
+      line = $0
+      if (!in_node &&
+          line ~ "^[[:space:]]*" node_name "@" expected \
+                  "[[:space:]]*\\{") {
+        in_node = 1
+        depth = 0
+      }
+      if (in_node) {
+        opened = gsub(/\{/, "{", line)
+        closed = gsub(/\}/, "}", line)
+        depth += opened - closed
+
+        reg_line = $0
+        if (reg_line ~ /^[[:space:]]*reg[[:space:]]*=/) {
+          sub(/^[^<]*</, "", reg_line)
+          sub(/>.*/, "", reg_line)
+          cell_count = split(reg_line, cells, /[[:space:]]+/)
+          if (cell_count >= 4 &&
+              normalize_hex(cells[2]) == expected)
+            found = 1
+        }
+        if (depth <= 0)
+          in_node = 0
+      }
+    }
+    END { exit(found ? 0 : 1) }
+  ' "$dtbo_dts"; then
+    cat >&2 <<EOF
+error: DTBO compute-unit node has no matching control-address reg property.
+  instance: $instance
+  node:     $node_name@$normalized_address
+  address:  $address
+  xclbin:   $xclbin_input
+  DTBO:     $dtbo_input
+Regenerate the DTBO from the XSA exported by the same Vitis link.
+EOF
+    exit 2
+  fi
 done <"$accelerator_map"
 
 xclbinutil \

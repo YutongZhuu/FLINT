@@ -334,7 +334,7 @@ test -s "$test_root/firmware/profile-app/profile-app.dtbo"
 test -s "$test_root/firmware/profile-app/profile-app.xclbin"
 test -s "$test_root/firmware/profile-app/shell.json"
 
-sed 's/@a0010000/@a0090000/g; s/0xa0010000/0xa0090000/g' \
+sed 's/0xa0010000/0xa0090000/g' \
   "$test_root/matching.dtbo" >"$test_root/wrong-address.dtbo"
 if PATH="$mock_bin:$PATH" \
   KV260_APP_NAME=profile-app \
@@ -347,7 +347,7 @@ if PATH="$mock_bin:$PATH" \
   echo "error: mismatched DTBO accelerator address unexpectedly passed" >&2
   exit 1
 fi
-grep -Fq 'DTBO does not contain the xclbin compute-unit address mapping' \
+grep -Fq 'DTBO compute-unit node has no matching control-address reg' \
   "$test_root/wrong-address.stderr"
 
 printf 'firmware-name = "wrong-app.bit.bin";\n' >"$test_root/mismatched.dtbo"
@@ -434,7 +434,7 @@ if (
   echo "error: reused XRT profile directory unexpectedly passed" >&2
   exit 1
 fi
-grep -Fq 'XRT profile output path already exists' \
+grep -Fq 'could not create fresh XRT profile output path' \
   "$test_root/reused.stderr"
 
 (
