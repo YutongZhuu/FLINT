@@ -1,4 +1,5 @@
 #include "Conv1x1Int8Kernel.h"
+#include "Int8Requantize.h"
 
 #include <stdint.h>
 
@@ -45,17 +46,21 @@ static int32_t reduce8(const int32_t value[kInputParallel]) {
 } // namespace
 
 extern "C" void conv1x1_i8_kernel(const int8_t *x, const int8_t *weight,
-    int32_t *accumulator, int n_size, int c_size, int h_size,
-    int input_w_size, int m_size, int x_zero_point, int w_zero_point) {
+    const int32_t *bias, int8_t *output, int n_size, int c_size, int h_size,
+    int input_w_size, int m_size, int x_zero_point, int w_zero_point,
+    uint32_t requant_multiplier_bits, int output_zero_point) {
 #pragma HLS INTERFACE m_axi port = x offset = slave bundle = gmem0 \
     max_read_burst_length = 64 num_read_outstanding = 16
 #pragma HLS INTERFACE m_axi port = weight offset = slave bundle = gmem1 \
     max_read_burst_length = 64 num_read_outstanding = 16
-#pragma HLS INTERFACE m_axi port = accumulator offset = slave bundle = gmem2 \
+#pragma HLS INTERFACE m_axi port = bias offset = slave bundle = gmem2 \
+    max_read_burst_length = 64 num_read_outstanding = 16
+#pragma HLS INTERFACE m_axi port = output offset = slave bundle = gmem3 \
     max_write_burst_length = 64 num_write_outstanding = 16
 #pragma HLS INTERFACE s_axilite port = x bundle = control
 #pragma HLS INTERFACE s_axilite port = weight bundle = control
-#pragma HLS INTERFACE s_axilite port = accumulator bundle = control
+#pragma HLS INTERFACE s_axilite port = bias bundle = control
+#pragma HLS INTERFACE s_axilite port = output bundle = control
 #pragma HLS INTERFACE s_axilite port = n_size bundle = control
 #pragma HLS INTERFACE s_axilite port = c_size bundle = control
 #pragma HLS INTERFACE s_axilite port = h_size bundle = control
@@ -63,11 +68,14 @@ extern "C" void conv1x1_i8_kernel(const int8_t *x, const int8_t *weight,
 #pragma HLS INTERFACE s_axilite port = m_size bundle = control
 #pragma HLS INTERFACE s_axilite port = x_zero_point bundle = control
 #pragma HLS INTERFACE s_axilite port = w_zero_point bundle = control
+#pragma HLS INTERFACE s_axilite port = requant_multiplier_bits bundle = control
+#pragma HLS INTERFACE s_axilite port = output_zero_point bundle = control
 #pragma HLS INTERFACE s_axilite port = return bundle = control
 
-  if (!x || !weight || !accumulator || n_size <= 0 || c_size <= 0 ||
+  if (!x || !weight || !bias || !output || n_size <= 0 || c_size <= 0 ||
       c_size > MYACCEL_CONV1X1_INT8_MAX_INPUT_CHANNELS || h_size <= 0 ||
-      input_w_size <= 0 || m_size <= 0)
+      input_w_size <= 0 || m_size <= 0 ||
+      !myaccel_int8::isPositiveNormalMultiplier(requant_multiplier_bits))
     return;
 
   const int spatial_size = h_size * input_w_size;
@@ -76,11 +84,20 @@ OutputBlockLoop:
   for (int m_block = 0; m_block < m_size; m_block += kOutputBlock) {
     centered_t
         weight_cache[kOutputBlock][MYACCEL_CONV1X1_INT8_MAX_INPUT_CHANNELS];
+    int32_t bias_cache[kOutputBlock];
 #pragma HLS ARRAY_RESHAPE variable = weight_cache cyclic \
     factor = kOutputParallel dim = 1
 #pragma HLS ARRAY_RESHAPE variable = weight_cache cyclic \
     factor = kInputParallel dim = 2
 #pragma HLS BIND_STORAGE variable = weight_cache type = ram_2p impl = bram
+#pragma HLS ARRAY_PARTITION variable = bias_cache complete
+
+  LoadBiasLoop:
+    for (int local_m = 0; local_m < kOutputBlock; ++local_m) {
+#pragma HLS PIPELINE II = 1
+      const int m = m_block + local_m;
+      bias_cache[local_m] = m < m_size ? bias[m] : 0;
+    }
 
   LoadWeightOutputLoop:
     for (int local_m = 0; local_m < kOutputBlock; ++local_m) {
@@ -217,7 +234,9 @@ OutputBlockLoop:
             if (m < m_size && spatial < spatial_size) {
               const uint32_t output_index =
                   ((uint32_t)n * m_size + m) * spatial_size + spatial;
-              accumulator[output_index] = accum[local_m][pixel];
+              output[output_index] = myaccel_int8::requantize(
+                  accum[local_m][pixel], bias_cache[local_m],
+                  requant_multiplier_bits, output_zero_point);
             }
           }
         }

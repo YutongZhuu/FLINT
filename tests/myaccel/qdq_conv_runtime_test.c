@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,14 +27,17 @@ int myaccel_xrt_conv2d_f32(const float *x, const float *weight,
 
 static int i8XrtCalls;
 
-// Stand in for the FPGA kernel: compute only centered INT8 dot products. The
-// runtime under test must keep bias and requantization on the host.
+// Stand in for the FPGA kernel: compute centered INT8 dot products, add bias,
+// and apply the same float32 requantization contract as the HLS kernel.
 int myaccel_xrt_conv2d_i8(const int8_t *x, const int8_t *weight,
-    int32_t *accumulator, int nSize, int cSize, int hSize, int wSize,
-    int mSize, int khSize, int kwSize, int ohSize, int owSize, int dh, int dw,
-    int cPerGroup, int group, int padLeft, int padTop, int sh, int sw,
-    int xZeroPoint, int wZeroPoint) {
+    const int32_t *bias, int8_t *output, int nSize, int cSize, int hSize,
+    int wSize, int mSize, int khSize, int kwSize, int ohSize, int owSize,
+    int dh, int dw, int cPerGroup, int group, int padLeft, int padTop, int sh,
+    int sw, int xZeroPoint, int wZeroPoint, uint32_t requantMultiplierBits,
+    int outputZeroPoint) {
   ++i8XrtCalls;
+  float multiplier = 0.0f;
+  memcpy(&multiplier, &requantMultiplierBits, sizeof(multiplier));
   const int mPerGroup = mSize / group;
   for (int n = 0; n < nSize; ++n)
     for (int m = 0; m < mSize; ++m) {
@@ -58,7 +62,15 @@ int myaccel_xrt_conv2d_i8(const int8_t *x, const int8_t *weight,
                 sum +=
                     (input - xZeroPoint) * (kernel - wZeroPoint);
               }
-          accumulator[((n * mSize + m) * ohSize + oh) * owSize + ow] = sum;
+          int32_t quantized = (int32_t)nearbyintf(
+                                  (float)((int64_t)sum + bias[m]) * multiplier) +
+                              outputZeroPoint;
+          if (quantized < -128)
+            quantized = -128;
+          else if (quantized > 127)
+            quantized = 127;
+          output[((n * mSize + m) * ohSize + oh) * owSize + ow] =
+              (int8_t)quantized;
         }
     }
   return 1;
@@ -122,8 +134,7 @@ static int runCase(const char *name, int8_t *x, int64_t *xShape, int8_t *w,
       tensors[5], tensors[6], tensors[7], tensors[8], tensors[9], tensors[10],
       tensors[11], 1, 1, 1, pad, pad, stride, stride);
   ok &= checkOutput(name,
-      expectXrt ? "CPU=0 INT8 XRT plus host requant"
-                : "CPU=0 unsupported-shape host fallback",
+      expectXrt ? "CPU=0 full INT8 XRT" : "CPU=0 host fallback",
       actual, expected, count);
   const int expectedCalls = callsBeforeXrt + (expectXrt ? 1 : 0);
   if (i8XrtCalls != expectedCalls) {
@@ -160,6 +171,17 @@ int main(void) {
   ok &= runCase("zero-points-and-bias", shiftedX, xShape, shiftedW, wShape,
       shiftedBias, actual, yShape, shiftedExpected, 6, 0.5f, 1, 1.0f, -2,
       0.5f, 0, 1.0f, 5, 0, 1, 1);
+
+  const int8_t generalBiasExpected[6] = {1, 2, 0, -1, 64, -64};
+  memset(actual, 0, sizeof(actual));
+  ok &= runCase("mismatched-bias-scale-host-fallback", x, xShape, w,
+      wShape, shiftedBias, actual, yShape, generalBiasExpected, 6, 0.5f, 0,
+      1.0f, 0, 0.25f, 0, 1.0f, 0, 0, 1, 0);
+
+  memset(actual, 0, sizeof(actual));
+  ok &= runCase("nonzero-bias-zero-point-host-fallback", x, xShape, w,
+      wShape, shiftedBias, actual, yShape, generalBiasExpected, 6, 0.5f, 0,
+      1.0f, 0, 0.5f, 1, 1.0f, 0, 0, 1, 0);
 
   int64_t satXShape[4] = {1, 1, 1, 2};
   int64_t satYShape[4] = {1, 1, 1, 2};
