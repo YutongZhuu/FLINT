@@ -5,6 +5,7 @@ cd "$(dirname "$0")/.."
 
 cxx=${CXX:-clang++}
 kernel_dir=third_party/onnx-mlir/src/Accelerators/MyAccel/Runtime
+int8_kernel_dir=hw/hls
 test_src=third_party/onnx-mlir/src/Accelerators/MyAccel/Test/HlsConvKernelsTest.cpp
 int8_test_src=third_party/onnx-mlir/src/Accelerators/MyAccel/Test/HlsInt8ConvKernelsTest.cpp
 out_dir=build/hls-tests
@@ -37,9 +38,9 @@ mkdir -p "$out_dir"
   -Werror \
   -Wno-unknown-pragmas \
   -Wno-unused-label \
-  -I "$kernel_dir" \
-  "$kernel_dir/Conv1x1Int8Kernel.cpp" \
-  "$kernel_dir/Conv3x3Int8Kernel.cpp" \
+  -I "$int8_kernel_dir" \
+  "$int8_kernel_dir/Conv1x1Int8Kernel.cpp" \
+  "$int8_kernel_dir/Conv3x3Int8Kernel.cpp" \
   "$int8_test_src" \
   -o "$int8_test_exe"
 

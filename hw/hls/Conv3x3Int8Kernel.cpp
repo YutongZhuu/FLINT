@@ -17,6 +17,11 @@ constexpr int kInputTileHeight =
     (kOutputTileHeight - 1) * MYACCEL_CONV3X3_INT8_MAX_STRIDE + 3;
 constexpr int kInputTileWidth =
     (kOutputTileWidth - 1) * MYACCEL_CONV3X3_INT8_MAX_STRIDE + 3;
+constexpr int kInputPlaneSize = kInputTileHeight * kInputTileWidth;
+constexpr int kInputTileValues = kInputParallel * kInputPlaneSize;
+constexpr int kOutputTilePixels = kOutputTileHeight * kOutputTileWidth;
+constexpr int kComputeIterations =
+    (kOutputBlock / kOutputParallel) * kOutputTilePixels;
 
 #ifdef __SYNTHESIS__
 using centered_t = ap_int<9>;
@@ -143,12 +148,13 @@ OutputBlockLoop:
       OutputTileColumnLoop:
         for (int ow_base = 0; ow_base < ow_size;
              ow_base += kOutputTileWidth) {
-          centered_t
-              input_tile[kInputParallel][kInputTileHeight][kInputTileWidth];
+          centered_t input_tile[2][kInputParallel][kInputTileHeight]
+                               [kInputTileWidth];
           int32_t accum[kOutputBlock][kOutputTileHeight][kOutputTileWidth];
 #pragma HLS ARRAY_PARTITION variable = input_tile complete dim = 1
 #pragma HLS ARRAY_PARTITION variable = input_tile complete dim = 2
 #pragma HLS ARRAY_PARTITION variable = input_tile complete dim = 3
+#pragma HLS ARRAY_PARTITION variable = input_tile complete dim = 4
 // Pack eight output lanes into one 256-bit word and retain tile positions as
 // RAM depth. Partitioning tile positions would waste one BRAM per shallow bank.
 #pragma HLS ARRAY_RESHAPE variable = accum cyclic \
@@ -173,96 +179,123 @@ OutputBlockLoop:
             }
           }
 
-        InputChannelTileLoop:
-          for (int c_base = 0; c_base < c_size;
-               c_base += kInputParallel) {
-            const int remaining_oh = oh_size - oh_base;
-            const int remaining_ow = ow_size - ow_base;
-            const int valid_oh = remaining_oh < kOutputTileHeight
-                                     ? remaining_oh
-                                     : kOutputTileHeight;
-            const int valid_ow = remaining_ow < kOutputTileWidth
-                                     ? remaining_ow
-                                     : kOutputTileWidth;
-            const int patch_height = (valid_oh - 1) * stride_h + 3;
-            const int patch_width = (valid_ow - 1) * stride_w + 3;
-            const int input_row_base = oh_base * stride_h - pad_top;
-            const int input_column_base = ow_base * stride_w - pad_left;
+          const int remaining_oh = oh_size - oh_base;
+          const int remaining_ow = ow_size - ow_base;
+          const int valid_oh = remaining_oh < kOutputTileHeight
+                                   ? remaining_oh
+                                   : kOutputTileHeight;
+          const int valid_ow = remaining_ow < kOutputTileWidth
+                                   ? remaining_ow
+                                   : kOutputTileWidth;
+          const int patch_height = (valid_oh - 1) * stride_h + 3;
+          const int patch_width = (valid_ow - 1) * stride_w + 3;
+          const int input_row_base = oh_base * stride_h - pad_top;
+          const int input_column_base = ow_base * stride_w - pad_left;
+          const int input_channel_tiles =
+              (c_size + kInputParallel - 1) / kInputParallel;
 
-          LoadInputChannelLoop:
-            for (int input_lane = 0; input_lane < kInputParallel;
-                 ++input_lane) {
-              const int c = c_base + input_lane;
-            LoadInputRowLoop:
-              for (int local_ih = 0; local_ih < kInputTileHeight; ++local_ih) {
-              LoadInputColumnLoop:
-                for (int local_iw = 0; local_iw < kInputTileWidth;
-                     ++local_iw) {
+// Prime one bank. Each following phase consumes the current bank while the
+// AXI port fills the other bank with the next input-channel patch.
+        PreloadFirstInputTileLoop:
+          for (int load_index = 0; load_index < kInputTileValues;
+               ++load_index) {
 #pragma HLS PIPELINE II = 1
-                  const int ih = input_row_base + local_ih;
-                  const int iw = input_column_base + local_iw;
-                  if (c < c_size && local_ih < patch_height &&
-                      local_iw < patch_width && ih >= 0 && ih < h_size &&
-                      iw >= 0 && iw < input_w_size) {
-                    const uint32_t x_index =
-                        ((uint32_t)n * c_size + c) * h_size * input_w_size +
-                        (uint32_t)ih * input_w_size + iw;
-                    input_tile[input_lane][local_ih][local_iw] =
-                        (centered_t)((int32_t)x[x_index] - x_zero_point);
-                  } else {
-                    input_tile[input_lane][local_ih][local_iw] = 0;
-                  }
+            const int input_lane = load_index / kInputPlaneSize;
+            const int input_position = load_index % kInputPlaneSize;
+            const int local_ih = input_position / kInputTileWidth;
+            const int local_iw = input_position % kInputTileWidth;
+            const int c = input_lane;
+            const int ih = input_row_base + local_ih;
+            const int iw = input_column_base + local_iw;
+            if (c < c_size && local_ih < patch_height &&
+                local_iw < patch_width && ih >= 0 && ih < h_size && iw >= 0 &&
+                iw < input_w_size) {
+              const uint32_t x_index =
+                  ((uint32_t)n * c_size + c) * h_size * input_w_size +
+                  (uint32_t)ih * input_w_size + iw;
+              input_tile[0][input_lane][local_ih][local_iw] =
+                  (centered_t)((int32_t)x[x_index] - x_zero_point);
+            } else {
+              input_tile[0][input_lane][local_ih][local_iw] = 0;
+            }
+          }
+
+        InputChannelTileLoop:
+          for (int channel_tile = 0; channel_tile < input_channel_tiles;
+               ++channel_tile) {
+            const int c_base = channel_tile * kInputParallel;
+            const int current_buffer = channel_tile & 1;
+            const int next_buffer = current_buffer ^ 1;
+            const bool has_next = channel_tile + 1 < input_channel_tiles;
+            const int phase_iterations =
+                has_next ? kInputTileValues : kComputeIterations;
+
+          OverlapInputLoadComputeLoop:
+            for (int phase = 0; phase < phase_iterations; ++phase) {
+#pragma HLS PIPELINE II = 1
+#pragma HLS DEPENDENCE variable = input_tile inter false
+#pragma HLS DEPENDENCE variable = accum inter false
+              if (has_next) {
+                const int input_lane = phase / kInputPlaneSize;
+                const int input_position = phase % kInputPlaneSize;
+                const int local_ih = input_position / kInputTileWidth;
+                const int local_iw = input_position % kInputTileWidth;
+                const int c = c_base + kInputParallel + input_lane;
+                const int ih = input_row_base + local_ih;
+                const int iw = input_column_base + local_iw;
+                if (c < c_size && local_ih < patch_height &&
+                    local_iw < patch_width && ih >= 0 && ih < h_size &&
+                    iw >= 0 && iw < input_w_size) {
+                  const uint32_t x_index =
+                      ((uint32_t)n * c_size + c) * h_size * input_w_size +
+                      (uint32_t)ih * input_w_size + iw;
+                  input_tile[next_buffer][input_lane][local_ih][local_iw] =
+                      (centered_t)((int32_t)x[x_index] - x_zero_point);
+                } else {
+                  input_tile[next_buffer][input_lane][local_ih][local_iw] = 0;
                 }
               }
-            }
 
-          OutputSubBlockLoop:
-            for (int output_base = 0; output_base < kOutputBlock;
-                 output_base += kOutputParallel) {
-            ComputeOutputRowLoop:
-              for (int local_oh = 0; local_oh < kOutputTileHeight;
-                   ++local_oh) {
-              ComputeOutputColumnLoop:
-                for (int local_ow = 0; local_ow < kOutputTileWidth;
-                     ++local_ow) {
-#pragma HLS PIPELINE II = 1
-#pragma HLS DEPENDENCE variable = accum inter false
-                ComputeOutputLaneLoop:
-                  for (int output_lane = 0;
-                       output_lane < kOutputParallel; ++output_lane) {
+              if (phase < kComputeIterations) {
+                const int output_group = phase / kOutputTilePixels;
+                const int output_position = phase % kOutputTilePixels;
+                const int output_base = output_group * kOutputParallel;
+                const int local_oh = output_position / kOutputTileWidth;
+                const int local_ow = output_position % kOutputTileWidth;
+              ComputeOutputLaneLoop:
+                for (int output_lane = 0;
+                     output_lane < kOutputParallel; ++output_lane) {
 #pragma HLS UNROLL
-                    const int local_m = output_base + output_lane;
-                    int32_t products[kInputParallel * 3 * 3];
+                  const int local_m = output_base + output_lane;
+                  int32_t products[kInputParallel * 3 * 3];
 #pragma HLS ARRAY_PARTITION variable = products complete
-                  ProductInputLaneLoop:
-                    for (int input_lane = 0;
-                         input_lane < kInputParallel; ++input_lane) {
+                ProductInputLaneLoop:
+                  for (int input_lane = 0;
+                       input_lane < kInputParallel; ++input_lane) {
 #pragma HLS UNROLL
-                      const int c = c_base + input_lane;
-                    ProductRowLoop:
-                      for (int kh = 0; kh < 3; ++kh) {
+                    const int c = c_base + input_lane;
+                  ProductRowLoop:
+                    for (int kh = 0; kh < 3; ++kh) {
 #pragma HLS UNROLL
-                      ProductColumnLoop:
-                        for (int kw = 0; kw < 3; ++kw) {
+                    ProductColumnLoop:
+                      for (int kw = 0; kw < 3; ++kw) {
 #pragma HLS UNROLL
-                          const int product_index =
-                              (input_lane * 3 + kh) * 3 + kw;
-                          const centered_t weight_value =
-                              c < c_size
-                                  ? weight_cache[local_m][c][kh][kw]
-                                  : centered_t(0);
-                          const int local_ih = local_oh * stride_h + kh;
-                          const int local_iw = local_ow * stride_w + kw;
-                          products[product_index] =
-                              dspMultiply(input_tile[input_lane][local_ih]
-                                                    [local_iw],
-                                  weight_value);
-                        }
+                        const int product_index =
+                            (input_lane * 3 + kh) * 3 + kw;
+                        const centered_t weight_value =
+                            c < c_size
+                                ? weight_cache[local_m][c][kh][kw]
+                                : centered_t(0);
+                        const int local_ih = local_oh * stride_h + kh;
+                        const int local_iw = local_ow * stride_w + kw;
+                        products[product_index] = dspMultiply(
+                            input_tile[current_buffer][input_lane][local_ih]
+                                      [local_iw],
+                            weight_value);
                       }
                     }
-                    accum[local_m][local_oh][local_ow] +=
-                        reduce36(products);
                   }
+                  accum[local_m][local_oh][local_ow] += reduce36(products);
                 }
               }
             }

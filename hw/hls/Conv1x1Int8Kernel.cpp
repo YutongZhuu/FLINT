@@ -12,6 +12,9 @@ constexpr int kInputParallel = 8;
 constexpr int kOutputParallel = 8;
 constexpr int kOutputBlock = 16;
 constexpr int kPixelTile = 16;
+constexpr int kInputLoadIterations = kInputParallel * kPixelTile;
+constexpr int kComputeIterations =
+    (kOutputBlock / kOutputParallel) * kPixelTile;
 
 #ifdef __SYNTHESIS__
 using centered_t = ap_int<9>;
@@ -98,9 +101,10 @@ OutputBlockLoop:
     PixelTileLoop:
       for (int pixel_base = 0; pixel_base < spatial_size;
            pixel_base += kPixelTile) {
-        centered_t input_tile[kInputParallel][kPixelTile];
+        centered_t input_tile[2][kInputParallel][kPixelTile];
         int32_t accum[kOutputBlock][kPixelTile];
 #pragma HLS ARRAY_PARTITION variable = input_tile complete dim = 1
+#pragma HLS ARRAY_PARTITION variable = input_tile complete dim = 2
 // Pack eight output lanes into one 256-bit word. Keeping the pixel dimension
 // intact gives BRAM useful depth instead of creating one shallow RAM per pixel.
 #pragma HLS ARRAY_RESHAPE variable = accum cyclic \
@@ -122,35 +126,63 @@ OutputBlockLoop:
           }
         }
 
-      InputChannelTileLoop:
-        for (int c_base = 0; c_base < c_size;
-             c_base += kInputParallel) {
-        LoadInputChannelLoop:
-          for (int input_lane = 0; input_lane < kInputParallel;
-               ++input_lane) {
-            const int c = c_base + input_lane;
-          LoadInputPixelLoop:
-            for (int pixel = 0; pixel < kPixelTile; ++pixel) {
+        const int input_channel_tiles =
+            (c_size + kInputParallel - 1) / kInputParallel;
+
+// Prime one bank. Each following phase consumes the current bank while the
+// AXI port fills the other bank with the next input-channel tile.
+      PreloadFirstInputTileLoop:
+        for (int load_index = 0; load_index < kInputLoadIterations;
+             ++load_index) {
 #pragma HLS PIPELINE II = 1
+          const int input_lane = load_index / kPixelTile;
+          const int pixel = load_index % kPixelTile;
+          const int c = input_lane;
+          const int spatial = pixel_base + pixel;
+          if (c < c_size && spatial < spatial_size) {
+            const uint32_t x_index =
+                ((uint32_t)n * c_size + c) * spatial_size + spatial;
+            input_tile[0][input_lane][pixel] =
+                (centered_t)((int32_t)x[x_index] - x_zero_point);
+          } else {
+            input_tile[0][input_lane][pixel] = 0;
+          }
+        }
+
+      InputChannelTileLoop:
+        for (int channel_tile = 0; channel_tile < input_channel_tiles;
+             ++channel_tile) {
+          const int c_base = channel_tile * kInputParallel;
+          const int current_buffer = channel_tile & 1;
+          const int next_buffer = current_buffer ^ 1;
+          const bool has_next = channel_tile + 1 < input_channel_tiles;
+          const int phase_iterations =
+              has_next ? kInputLoadIterations : kComputeIterations;
+
+        OverlapInputLoadComputeLoop:
+          for (int phase = 0; phase < phase_iterations; ++phase) {
+#pragma HLS PIPELINE II = 1
+#pragma HLS DEPENDENCE variable = input_tile inter false
+#pragma HLS DEPENDENCE variable = accum inter false
+            if (has_next) {
+              const int input_lane = phase / kPixelTile;
+              const int pixel = phase % kPixelTile;
+              const int c = c_base + kInputParallel + input_lane;
               const int spatial = pixel_base + pixel;
               if (c < c_size && spatial < spatial_size) {
                 const uint32_t x_index =
                     ((uint32_t)n * c_size + c) * spatial_size + spatial;
-                input_tile[input_lane][pixel] =
+                input_tile[next_buffer][input_lane][pixel] =
                     (centered_t)((int32_t)x[x_index] - x_zero_point);
               } else {
-                input_tile[input_lane][pixel] = 0;
+                input_tile[next_buffer][input_lane][pixel] = 0;
               }
             }
-          }
 
-        OutputSubBlockLoop:
-          for (int output_base = 0; output_base < kOutputBlock;
-               output_base += kOutputParallel) {
-          ComputePixelLoop:
-            for (int pixel = 0; pixel < kPixelTile; ++pixel) {
-#pragma HLS PIPELINE II = 1
-#pragma HLS DEPENDENCE variable = accum inter false
+            if (phase < kComputeIterations) {
+              const int output_base =
+                  (phase / kPixelTile) * kOutputParallel;
+              const int pixel = phase % kPixelTile;
             ComputeOutputLaneLoop:
               for (int output_lane = 0;
                    output_lane < kOutputParallel; ++output_lane) {
@@ -165,8 +197,9 @@ OutputBlockLoop:
                   const int c = c_base + input_lane;
                   const centered_t weight_value =
                       c < c_size ? weight_cache[local_m][c] : centered_t(0);
-                  products[input_lane] =
-                      dspMultiply(input_tile[input_lane][pixel], weight_value);
+                  products[input_lane] = dspMultiply(
+                      input_tile[current_buffer][input_lane][pixel],
+                      weight_value);
                 }
                 accum[local_m][pixel] += reduce8(products);
               }
