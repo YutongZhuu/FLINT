@@ -6,9 +6,10 @@ Run the MyAccel QDQ runtime tests:
 ./tests/myaccel/test_qdq_runtime.sh
 ```
 
-This exercises both `CPU=1` host execution and the INT8 accelerator boundary
-with host-side bias and requantization. It also verifies that a 6x6 INT8
-convolution does not invoke XRT and uses the software fallback.
+This exercises both `CPU=1` host execution and the full INT8 accelerator
+boundary with hardware bias/requantization. It verifies both the disabled 6x6
+host fallback and the opt-in packed 6x6 dispatch, plus unsupported 6x6 host
+fallback behavior.
 
 Run the ordinary C++ numerical models for all HLS kernels:
 

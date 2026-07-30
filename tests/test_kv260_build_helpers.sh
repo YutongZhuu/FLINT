@@ -129,8 +129,13 @@ cat >"$mock_bin/xclbinutil" <<'EOF'
 set -euo pipefail
 
 raw_bit=
+show_info=0
 while [ $# -gt 0 ]; do
   case "$1" in
+  --info)
+    show_info=1
+    shift
+    ;;
   --dump-section)
     raw_bit=${2#BITSTREAM:RAW:}
     shift 2
@@ -138,6 +143,14 @@ while [ $# -gt 0 ]; do
   *) shift ;;
   esac
 done
+if [ "$show_info" = "1" ]; then
+  cat <<'INFO'
+Kernel: conv1x1_i8_kernel
+Instance:        conv1x1_i8_kernel_1
+   Base Address: 0xa0010000
+INFO
+  exit 0
+fi
 test -n "$raw_bit"
 mkdir -p "$(dirname "$raw_bit")"
 printf 'mock raw bit\n' >"$raw_bit"
@@ -216,6 +229,18 @@ cat >"$KV260_DTG_OUT/pl.dtsi" <<'DTS'
     __overlay__ {
       firmware-name = "vpl_gen_fixed.bit.bin";
     };
+  };
+  fragment@1 {
+    target-path = "/axi";
+    __overlay__ {
+      conv1x1_i8_kernel@a0010000 {
+        compatible = "xlnx,conv1x1-i8-kernel-1.0";
+        reg = <0x0 0xa0010000 0x0 0x10000>;
+      };
+    };
+  };
+  __symbols__ {
+    conv1x1_i8_kernel_1 = "/fragment@1/__overlay__/conv1x1_i8_kernel@a0010000";
   };
 };
 DTS
@@ -309,6 +334,22 @@ test -s "$test_root/firmware/profile-app/profile-app.dtbo"
 test -s "$test_root/firmware/profile-app/profile-app.xclbin"
 test -s "$test_root/firmware/profile-app/shell.json"
 
+sed 's/@a0010000/@a0090000/g; s/0xa0010000/0xa0090000/g' \
+  "$test_root/matching.dtbo" >"$test_root/wrong-address.dtbo"
+if PATH="$mock_bin:$PATH" \
+  KV260_APP_NAME=profile-app \
+  ./scripts/package_kv260_firmware.sh \
+    "$test_root/input.xclbin" \
+    "$test_root/wrong-address.dtbo" \
+    "$test_root/firmware/wrong-address" \
+    >"$test_root/wrong-address.stdout" \
+    2>"$test_root/wrong-address.stderr"; then
+  echo "error: mismatched DTBO accelerator address unexpectedly passed" >&2
+  exit 1
+fi
+grep -Fq 'DTBO does not contain the xclbin compute-unit address mapping' \
+  "$test_root/wrong-address.stderr"
+
 printf 'firmware-name = "wrong-app.bit.bin";\n' >"$test_root/mismatched.dtbo"
 if PATH="$mock_bin:$PATH" \
   KV260_APP_NAME=profile-app \
@@ -376,6 +417,25 @@ test -s "$test_root/xrt-output/xrt.run_summary"
 test -s "$test_root/xrt-output/summary.csv"
 test -s "$test_root/xrt-output/native_trace.csv"
 test -s "$test_root/xrt-output/device_trace_0.csv"
+
+if (
+  cd "$test_root"
+  MYACCEL_XCLBIN="$profile_package/profile.xclbin" \
+  MYACCEL_XRT_PROFILE_DIR="$test_root/xrt-output" \
+  MYACCEL_XRT_INI="$profile_package/xrt-profile.ini" \
+  TIME_BIN="$mock_bin/time" \
+    "$profile_package/run-profile.sh" \
+      "$profile_package/input.bin" \
+      reused-output.bin \
+      reused-profile.log \
+      >"$test_root/reused.stdout" \
+      2>"$test_root/reused.stderr"
+); then
+  echo "error: reused XRT profile directory unexpectedly passed" >&2
+  exit 1
+fi
+grep -Fq 'XRT profile output path already exists' \
+  "$test_root/reused.stderr"
 
 (
   cd "$test_root"

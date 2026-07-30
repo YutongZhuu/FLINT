@@ -52,6 +52,15 @@ unset CPU
 unset MYACCEL_FORCE_CPU
 unset XCL_EMULATION_MODE
 
+if [[ -e "${profile_dir}" ]]; then
+  cat >&2 <<EOF
+error: XRT profile output path already exists: ${profile_dir}
+Use a fresh MYACCEL_XRT_PROFILE_DIR for every run so stale XRT artifacts
+cannot be accepted as evidence for the current invocation.
+EOF
+  exit 1
+fi
+
 mkdir -p "${profile_dir}" "$(dirname "${output}")" "$(dirname "${log}")"
 
 echo "XCLBIN: ${MYACCEL_XCLBIN}"

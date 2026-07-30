@@ -474,6 +474,10 @@ to the Arm for post-processing. The default image contains 1x1 and 3x3 only.
 The 6x6 stem is a separate fit experiment and is enabled at build time with
 `VITIS_INCLUDE_6X6_STEM=1`, then at runtime with
 `MYACCEL_ENABLE_6X6_STEM=1`. Without both, the stem safely remains on the host.
+The INT8 runtime accepts output only when XRT reports
+`ERT_CMD_STATE_COMPLETED`. Other command states return to the CPU fallback;
+the default per-layer timeout is 30 seconds and can be changed with a positive
+`MYACCEL_XRT_RUN_TIMEOUT_MS` value.
 
 Run the ordinary C++ numerical test before sending the sources to a Vitis
 machine:
@@ -673,6 +677,15 @@ MYACCEL_XRT_INI=$PWD/scripts/xrt-counters.ini \
 XRT_INI_PATH=$PWD/scripts/xrt-profile.ini \
   ./host_xrt_int8_test ./conv_int8_only.hw.xclbin --int8-3x3-only
 ```
+
+Set `MYACCEL_XRT_PROFILE_DIR` to a new, nonexistent directory for each full
+profile. The runner rejects an existing path so stale summaries or traces
+cannot be accepted as evidence from a later invocation.
+
+Firmware packaging verifies more than the mutable `firmware-name`: every
+xclbin compute-unit instance/control address must also appear in the DTBO
+symbol map. A mismatch requires regenerating the overlay from the XSA exported
+by the same Vitis link.
 
 `xdputil` inspects and benchmarks Vitis AI DPU/xmodel deployments. These are
 custom HLS/XRT kernels, so their scheduling evidence comes from HLS reports,
