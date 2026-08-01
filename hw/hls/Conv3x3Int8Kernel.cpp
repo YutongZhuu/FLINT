@@ -22,6 +22,11 @@ constexpr int kInputTileHeight =
     (kOutputTileHeight - 1) * MYACCEL_CONV3X3_INT8_MAX_STRIDE + 3;
 constexpr int kInputTileWidth =
     (kOutputTileWidth - 1) * MYACCEL_CONV3X3_INT8_MAX_STRIDE + 3;
+constexpr int kPackedInputRowWords =
+    (kInputTileWidth + kPackedBytes - 1) / kPackedBytes;
+constexpr int kPackedInputBankWords =
+    kInputParallel * kInputTileHeight * kPackedInputRowWords;
+constexpr int kPackedInputBufferWords = 2 * kPackedInputBankWords;
 
 #ifdef __SYNTHESIS__
 using centered_t = ap_int<9>;
@@ -49,6 +54,176 @@ static uint32_t packInt8(const int8_t bytes[kPackedBytes]) {
          ((uint32_t)(uint8_t)bytes[1] << 8) |
          ((uint32_t)(uint8_t)bytes[2] << 16) |
          ((uint32_t)(uint8_t)bytes[3] << 24);
+}
+
+static int packedInputIndex(
+    int bank, int input_lane, int local_ih, int word_offset) {
+#pragma HLS INLINE
+  return bank * kPackedInputBankWords +
+         (input_lane * kInputTileHeight + local_ih) *
+             kPackedInputRowWords +
+         word_offset;
+}
+
+// Load the valid portion of one four-channel patch as contiguous packed words.
+// Padding is deliberately excluded from this loop so the x access is an
+// unconditional, monotonically-increasing AXI read that HLS can burst.
+static void loadPackedInputTile(const uint32_t *x,
+    uint32_t packed_input[kPackedInputBufferWords], int bank, int n,
+    int c_size, int h_size, int input_w_size, int c_base, int patch_height,
+    int patch_width, int input_row_base, int input_column_base) {
+#pragma HLS INLINE off
+  const int first_local_row =
+      input_row_base < 0 ? -input_row_base : 0;
+  const int rows_inside_image = h_size - input_row_base;
+  const int last_local_row =
+      rows_inside_image < patch_height ? rows_inside_image : patch_height;
+
+  const int first_valid_column =
+      input_column_base < 0 ? 0 : input_column_base;
+  const int patch_last_column = input_column_base + patch_width - 1;
+  const int last_valid_column =
+      patch_last_column < input_w_size ? patch_last_column : input_w_size - 1;
+  const bool has_valid_region = first_local_row < last_local_row &&
+                                first_valid_column <= last_valid_column;
+  const int first_word_column =
+      has_valid_region
+          ? first_valid_column & ~(kPackedBytes - 1)
+          : 0;
+  const int last_word_column =
+      has_valid_region
+          ? last_valid_column & ~(kPackedBytes - 1)
+          : -kPackedBytes;
+  const int valid_word_count =
+      has_valid_region
+          ? (last_word_column - first_word_column) / kPackedBytes + 1
+          : 0;
+
+LoadPackedInputLaneLoop:
+  for (int input_lane = 0; input_lane < kInputParallel; ++input_lane) {
+    const int c = c_base + input_lane;
+  LoadPackedInputRowLoop:
+    for (int local_ih = first_local_row; local_ih < last_local_row;
+         ++local_ih) {
+      const int ih = input_row_base + local_ih;
+      const uint32_t row_byte_index =
+          ((uint32_t)n * c_size + c) * h_size * input_w_size +
+          (uint32_t)ih * input_w_size;
+      const uint32_t first_source_word =
+          row_byte_index / kPackedBytes + first_word_column / kPackedBytes;
+    BurstLoadPackedInputWords:
+      for (int word_offset = 0; word_offset < valid_word_count;
+           ++word_offset) {
+#pragma HLS PIPELINE II = 1
+        packed_input[packedInputIndex(
+            bank, input_lane, local_ih, word_offset)] =
+            x[first_source_word + word_offset];
+      }
+    }
+  }
+}
+
+// Expand one packed staging-bank into the fully-partitioned register window.
+// Keeping this conversion separate from the AXI loop removes conditional DDR
+// reads while preserving the 36 scalar activation reads needed by compute.
+static void expandPackedInputTile(
+    const uint32_t packed_input[kPackedInputBufferWords], int bank,
+    centered_t input_tile[kInputParallel][kInputTileHeight][kInputTileWidth],
+    int h_size, int input_w_size, int patch_height, int patch_width,
+    int input_row_base, int input_column_base, int x_zero_point) {
+#pragma HLS INLINE off
+ClearInputTileLaneLoop:
+  for (int input_lane = 0; input_lane < kInputParallel; ++input_lane) {
+  ClearInputTileRowLoop:
+    for (int local_ih = 0; local_ih < kInputTileHeight; ++local_ih) {
+    ClearInputTileWordLoop:
+      for (int local_iw_base = 0; local_iw_base < kInputTileWidth;
+           local_iw_base += kPackedBytes) {
+#pragma HLS PIPELINE II = 1
+      ClearInputTileByteLoop:
+        for (int byte_lane = 0; byte_lane < kPackedBytes; ++byte_lane) {
+#pragma HLS UNROLL
+          const int local_iw = local_iw_base + byte_lane;
+          if (local_iw < kInputTileWidth)
+            input_tile[input_lane][local_ih][local_iw] = 0;
+        }
+      }
+    }
+  }
+
+  const int first_local_row =
+      input_row_base < 0 ? -input_row_base : 0;
+  const int rows_inside_image = h_size - input_row_base;
+  const int last_local_row =
+      rows_inside_image < patch_height ? rows_inside_image : patch_height;
+  const int first_valid_column =
+      input_column_base < 0 ? 0 : input_column_base;
+  const int patch_last_column = input_column_base + patch_width - 1;
+  const int last_valid_column =
+      patch_last_column < input_w_size ? patch_last_column : input_w_size - 1;
+  const bool has_valid_region = first_local_row < last_local_row &&
+                                first_valid_column <= last_valid_column;
+  const int first_word_column =
+      has_valid_region
+          ? first_valid_column & ~(kPackedBytes - 1)
+          : 0;
+  const int last_word_column =
+      has_valid_region
+          ? last_valid_column & ~(kPackedBytes - 1)
+          : -kPackedBytes;
+  const int valid_word_count =
+      has_valid_region
+          ? (last_word_column - first_word_column) / kPackedBytes + 1
+          : 0;
+
+ExpandInputLaneLoop:
+  for (int input_lane = 0; input_lane < kInputParallel; ++input_lane) {
+  ExpandInputRowLoop:
+    for (int local_ih = first_local_row; local_ih < last_local_row;
+         ++local_ih) {
+    ExpandInputWordLoop:
+      for (int word_offset = 0; word_offset < valid_word_count;
+           ++word_offset) {
+#pragma HLS PIPELINE II = 1
+        const uint32_t packed_value = packed_input[packedInputIndex(
+            bank, input_lane, local_ih, word_offset)];
+      ExpandInputByteLoop:
+        for (int byte_lane = 0; byte_lane < kPackedBytes; ++byte_lane) {
+#pragma HLS UNROLL
+          const int iw = first_word_column + word_offset * kPackedBytes +
+                         byte_lane;
+          const int local_iw = iw - input_column_base;
+          if (iw >= first_valid_column && iw <= last_valid_column &&
+              local_iw >= 0 && local_iw < patch_width &&
+              local_iw < kInputTileWidth) {
+            input_tile[input_lane][local_ih][local_iw] =
+                (centered_t)((int32_t)unpackInt8(packed_value, byte_lane) -
+                             x_zero_point);
+          }
+        }
+      }
+    }
+  }
+}
+
+// Port 0 reads the current half while port 1 fills the other half. The DATAFLOW
+// boundary is intentional: it asks HLS to overlap the current-bank expansion
+// with the next-bank AXI burst without duplicating the physical staging RAM.
+static void loadNextAndExpandCurrent(const uint32_t *x,
+    uint32_t packed_input[kPackedInputBufferWords], int current_bank,
+    int next_bank,
+    centered_t input_tile[kInputParallel][kInputTileHeight][kInputTileWidth],
+    int n, int c_size, int h_size, int input_w_size, int next_c_base,
+    int patch_height, int patch_width, int input_row_base,
+    int input_column_base, int x_zero_point) {
+#pragma HLS INLINE off
+#pragma HLS DATAFLOW
+  loadPackedInputTile(x, packed_input, next_bank, n, c_size, h_size,
+      input_w_size, next_c_base, patch_height, patch_width, input_row_base,
+      input_column_base);
+  expandPackedInputTile(packed_input, current_bank, input_tile, h_size,
+      input_w_size, patch_height, patch_width, input_row_base,
+      input_column_base, x_zero_point);
 }
 
 static int32_t reduce36(const int32_t value[36]) {
@@ -182,9 +357,11 @@ OutputBlockLoop:
       OutputTileColumnLoop:
         for (int ow_base = 0; ow_base < ow_size;
              ow_base += kOutputTileWidth) {
+          uint32_t packed_input[kPackedInputBufferWords];
           centered_t
               input_tile[kInputParallel][kInputTileHeight][kInputTileWidth];
           int32_t accum[kOutputBlock][kOutputTileHeight][kOutputTileWidth];
+#pragma HLS BIND_STORAGE variable = packed_input type = ram_s2p impl = uram
 #pragma HLS ARRAY_PARTITION variable = input_tile complete dim = 1
 #pragma HLS ARRAY_PARTITION variable = input_tile complete dim = 2
 #pragma HLS ARRAY_PARTITION variable = input_tile complete dim = 3
@@ -212,107 +389,44 @@ OutputBlockLoop:
             }
           }
 
+          const int remaining_oh = oh_size - oh_base;
+          const int remaining_ow = ow_size - ow_base;
+          const int valid_oh = remaining_oh < kOutputTileHeight
+                                   ? remaining_oh
+                                   : kOutputTileHeight;
+          const int valid_ow = remaining_ow < kOutputTileWidth
+                                   ? remaining_ow
+                                   : kOutputTileWidth;
+          const int patch_height = (valid_oh - 1) * stride_h + 3;
+          const int patch_width = (valid_ow - 1) * stride_w + 3;
+          const int input_row_base = oh_base * stride_h - pad_top;
+          const int input_column_base = ow_base * stride_w - pad_left;
+          const int input_channel_tiles = c_size / kInputParallel;
+
+// Prime bank zero. Subsequent iterations read/expand one address range while
+// filling the other through the SDP write port.
+        PrimePackedInputTile:
+          loadPackedInputTile(x, packed_input, 0, n, c_size, h_size,
+              input_w_size, 0, patch_height, patch_width, input_row_base,
+              input_column_base);
+
         InputChannelTileLoop:
-          for (int c_base = 0; c_base < c_size;
-               c_base += kInputParallel) {
-            const int remaining_oh = oh_size - oh_base;
-            const int remaining_ow = ow_size - ow_base;
-            const int valid_oh = remaining_oh < kOutputTileHeight
-                                     ? remaining_oh
-                                     : kOutputTileHeight;
-            const int valid_ow = remaining_ow < kOutputTileWidth
-                                     ? remaining_ow
-                                     : kOutputTileWidth;
-            const int patch_height = (valid_oh - 1) * stride_h + 3;
-            const int patch_width = (valid_ow - 1) * stride_w + 3;
-            const int input_row_base = oh_base * stride_h - pad_top;
-            const int input_column_base = ow_base * stride_w - pad_left;
+          for (int channel_tile = 0; channel_tile < input_channel_tiles;
+               ++channel_tile) {
+            const int c_base = channel_tile * kInputParallel;
+            const int current_bank = channel_tile & 1;
+            const int next_bank = current_bank ^ 1;
+            const bool has_next = channel_tile + 1 < input_channel_tiles;
 
-          LoadInputChannelLoop:
-            for (int input_lane = 0; input_lane < kInputParallel;
-                 ++input_lane) {
-              const int c = c_base + input_lane;
-            LoadInputRowLoop:
-              for (int local_ih = 0; local_ih < kInputTileHeight;
-                   ++local_ih) {
-              LoadInputWordGroupLoop:
-                for (int local_iw_base = 0;
-                     local_iw_base < kInputTileWidth;
-                     local_iw_base += kPackedBytes) {
-#pragma HLS PIPELINE II = 1
-                  const int ih = input_row_base + local_ih;
-                  const int group_first_iw =
-                      input_column_base + local_iw_base;
-                  const int remaining_patch_columns =
-                      patch_width - local_iw_base;
-                  const int active_group_bytes =
-                      remaining_patch_columns <= 0
-                          ? 0
-                          : (remaining_patch_columns < kPackedBytes
-                                    ? remaining_patch_columns
-                                    : kPackedBytes);
-                  const int group_last_iw =
-                      group_first_iw + active_group_bytes - 1;
-                  const int valid_first_iw =
-                      group_first_iw < 0 ? 0 : group_first_iw;
-                  const int valid_last_iw = group_last_iw >= input_w_size
-                                                ? input_w_size - 1
-                                                : group_last_iw;
-                  const bool valid_row = c < c_size &&
-                                         local_ih < patch_height && ih >= 0 &&
-                                         ih < h_size;
-                  const bool has_valid_columns =
-                      active_group_bytes > 0 &&
-                      valid_first_iw <= valid_last_iw &&
-                      valid_first_iw < input_w_size && valid_last_iw >= 0;
-
-                  uint32_t first_word = 0;
-                  uint32_t second_word = 0;
-                  int first_word_column = 0;
-                  int second_word_column = 0;
-                  if (valid_row && has_valid_columns) {
-                    first_word_column = valid_first_iw & ~(kPackedBytes - 1);
-                    second_word_column = valid_last_iw & ~(kPackedBytes - 1);
-                    const uint32_t row_byte_index =
-                        ((uint32_t)n * c_size + c) * h_size * input_w_size +
-                        (uint32_t)ih * input_w_size;
-                    const uint32_t row_word_index =
-                        row_byte_index / kPackedBytes;
-                    first_word =
-                        x[row_word_index + first_word_column / kPackedBytes];
-                    second_word =
-                        second_word_column == first_word_column
-                            ? first_word
-                            : x[row_word_index +
-                                second_word_column / kPackedBytes];
-                  }
-
-                ScatterInputByteLoop:
-                  for (int byte_lane = 0; byte_lane < kPackedBytes;
-                       ++byte_lane) {
-#pragma HLS UNROLL
-                    const int local_iw = local_iw_base + byte_lane;
-                    const int iw = group_first_iw + byte_lane;
-                    if (local_iw < kInputTileWidth) {
-                      if (valid_row && local_iw < patch_width && iw >= 0 &&
-                          iw < input_w_size) {
-                        const int word_column =
-                            iw & ~(kPackedBytes - 1);
-                        const uint32_t packed_input =
-                            word_column == first_word_column ? first_word
-                                                             : second_word;
-                        input_tile[input_lane][local_ih][local_iw] =
-                            (centered_t)((int32_t)unpackInt8(
-                                             packed_input,
-                                             iw & (kPackedBytes - 1)) -
-                                         x_zero_point);
-                      } else {
-                        input_tile[input_lane][local_ih][local_iw] = 0;
-                      }
-                    }
-                  }
-                }
-              }
+            if (has_next) {
+              loadNextAndExpandCurrent(x, packed_input, current_bank,
+                  next_bank, input_tile, n, c_size, h_size, input_w_size,
+                  c_base + kInputParallel, patch_height, patch_width,
+                  input_row_base, input_column_base, x_zero_point);
+            } else {
+              expandPackedInputTile(packed_input, current_bank, input_tile,
+                  h_size, input_w_size, patch_height, patch_width,
+                  input_row_base, input_column_base, x_zero_point);
             }
 
           OutputSubBlockLoop:
