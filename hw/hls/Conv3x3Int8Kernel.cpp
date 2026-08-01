@@ -26,7 +26,6 @@ constexpr int kPackedInputRowWords =
     (kInputTileWidth + kPackedBytes - 1) / kPackedBytes;
 constexpr int kPackedInputBankWords =
     kInputParallel * kInputTileHeight * kPackedInputRowWords;
-constexpr int kPackedInputBufferWords = 2 * kPackedInputBankWords;
 
 #ifdef __SYNTHESIS__
 using centered_t = ap_int<9>;
@@ -57,11 +56,9 @@ static uint32_t packInt8(const int8_t bytes[kPackedBytes]) {
 }
 
 static int packedInputIndex(
-    int bank, int input_lane, int local_ih, int word_offset) {
+    int input_lane, int local_ih, int word_offset) {
 #pragma HLS INLINE
-  return bank * kPackedInputBankWords +
-         (input_lane * kInputTileHeight + local_ih) *
-             kPackedInputRowWords +
+  return (input_lane * kInputTileHeight + local_ih) * kPackedInputRowWords +
          word_offset;
 }
 
@@ -92,9 +89,9 @@ ClearInputTileLaneLoop:
 // Padding is deliberately excluded from this loop so the x access is an
 // unconditional, monotonically-increasing AXI read that HLS can burst.
 static void loadPackedInputTile(const uint32_t *x,
-    uint32_t packed_input[kPackedInputBufferWords], int bank, int n,
-    int c_size, int h_size, int input_w_size, int c_base, int patch_height,
-    int patch_width, int input_row_base, int input_column_base) {
+    uint32_t packed_input[kPackedInputBankWords], int n, int c_size,
+    int h_size, int input_w_size, int c_base, int patch_height, int patch_width,
+    int input_row_base, int input_column_base) {
 #pragma HLS INLINE off
   const int first_local_row =
       input_row_base < 0 ? -input_row_base : 0;
@@ -138,8 +135,7 @@ LoadPackedInputLaneLoop:
       for (int word_offset = 0; word_offset < valid_word_count;
            ++word_offset) {
 #pragma HLS PIPELINE II = 1
-        packed_input[packedInputIndex(
-            bank, input_lane, local_ih, word_offset)] =
+        packed_input[packedInputIndex(input_lane, local_ih, word_offset)] =
             x[first_source_word + word_offset];
       }
     }
@@ -150,7 +146,7 @@ LoadPackedInputLaneLoop:
 // Keeping this conversion separate from the AXI loop removes conditional DDR
 // reads while preserving the 36 scalar activation reads needed by compute.
 static void expandPackedInputTile(
-    const uint32_t packed_input[kPackedInputBufferWords], int bank,
+    const uint32_t packed_input[kPackedInputBankWords],
     centered_t input_tile[kInputParallel][kInputTileHeight][kInputTileWidth],
     int h_size, int input_w_size, int patch_height, int patch_width,
     int input_row_base, int input_column_base, int x_zero_point) {
@@ -191,8 +187,8 @@ ExpandInputLaneLoop:
       for (int word_offset = 0; word_offset < valid_word_count;
            ++word_offset) {
 #pragma HLS PIPELINE II = 1
-        const uint32_t packed_value = packed_input[packedInputIndex(
-            bank, input_lane, local_ih, word_offset)];
+        const uint32_t packed_value =
+            packed_input[packedInputIndex(input_lane, local_ih, word_offset)];
       ExpandInputByteLoop:
         for (int byte_lane = 0; byte_lane < kPackedBytes; ++byte_lane) {
 #pragma HLS UNROLL
@@ -212,85 +208,25 @@ ExpandInputLaneLoop:
   }
 }
 
-// Port 0 reads the current half while port 1 fills the other half. Keep both
-// accesses in one pipelined process: Vitis 2022.1 rejects one array parameter
-// shared by separate DATAFLOW reader/writer processes even though their bank
-// address ranges do not overlap. This form maps directly to a single SDP RAM.
+// Use separate array parameters for the two ping-pong banks. Vitis 2022.1
+// rejects a single array parameter shared by DATAFLOW reader/writer processes,
+// and dynamically selecting two address ranges causes pathological scheduling.
+// Distinct banks give DATAFLOW one read-only and one write-only channel.
 static void loadNextAndExpandCurrent(const uint32_t *x,
-    uint32_t packed_input[kPackedInputBufferWords], int current_bank,
-    int next_bank,
+    const uint32_t packed_current[kPackedInputBankWords],
+    uint32_t packed_next[kPackedInputBankWords],
     centered_t input_tile[kInputParallel][kInputTileHeight][kInputTileWidth],
     int n, int c_size, int h_size, int input_w_size, int next_c_base,
     int patch_height, int patch_width, int input_row_base,
     int input_column_base, int x_zero_point) {
 #pragma HLS INLINE off
-  clearInputTile(input_tile);
-
-  const int first_local_row =
-      input_row_base < 0 ? -input_row_base : 0;
-  const int rows_inside_image = h_size - input_row_base;
-  const int last_local_row =
-      rows_inside_image < patch_height ? rows_inside_image : patch_height;
-  const int first_valid_column =
-      input_column_base < 0 ? 0 : input_column_base;
-  const int patch_last_column = input_column_base + patch_width - 1;
-  const int last_valid_column =
-      patch_last_column < input_w_size ? patch_last_column : input_w_size - 1;
-  const bool has_valid_region = first_local_row < last_local_row &&
-                                first_valid_column <= last_valid_column;
-  const int first_word_column =
-      has_valid_region
-          ? first_valid_column & ~(kPackedBytes - 1)
-          : 0;
-  const int last_word_column =
-      has_valid_region
-          ? last_valid_column & ~(kPackedBytes - 1)
-          : -kPackedBytes;
-  const int valid_word_count =
-      has_valid_region
-          ? (last_word_column - first_word_column) / kPackedBytes + 1
-          : 0;
-
-OverlapInputLaneLoop:
-  for (int input_lane = 0; input_lane < kInputParallel; ++input_lane) {
-    const int next_c = next_c_base + input_lane;
-  OverlapInputRowLoop:
-    for (int local_ih = first_local_row; local_ih < last_local_row;
-         ++local_ih) {
-      const int ih = input_row_base + local_ih;
-      const uint32_t next_row_byte_index =
-          ((uint32_t)n * c_size + next_c) * h_size * input_w_size +
-          (uint32_t)ih * input_w_size;
-      const uint32_t next_first_source_word =
-          next_row_byte_index / kPackedBytes +
-          first_word_column / kPackedBytes;
-    OverlapPackedInputWordLoop:
-      for (int word_offset = 0; word_offset < valid_word_count;
-           ++word_offset) {
-#pragma HLS PIPELINE II = 1
-#pragma HLS DEPENDENCE variable = packed_input inter false
-        const uint32_t packed_value = packed_input[packedInputIndex(
-            current_bank, input_lane, local_ih, word_offset)];
-        packed_input[packedInputIndex(
-            next_bank, input_lane, local_ih, word_offset)] =
-            x[next_first_source_word + word_offset];
-      OverlapInputByteLoop:
-        for (int byte_lane = 0; byte_lane < kPackedBytes; ++byte_lane) {
-#pragma HLS UNROLL
-          const int iw = first_word_column + word_offset * kPackedBytes +
-                         byte_lane;
-          const int local_iw = iw - input_column_base;
-          if (iw >= first_valid_column && iw <= last_valid_column &&
-              local_iw >= 0 && local_iw < patch_width &&
-              local_iw < kInputTileWidth) {
-            input_tile[input_lane][local_ih][local_iw] =
-                (centered_t)((int32_t)unpackInt8(packed_value, byte_lane) -
-                             x_zero_point);
-          }
-        }
-      }
-    }
-  }
+#pragma HLS DATAFLOW
+  loadPackedInputTile(x, packed_next, n, c_size, h_size, input_w_size,
+      next_c_base, patch_height, patch_width, input_row_base,
+      input_column_base);
+  expandPackedInputTile(packed_current, input_tile, h_size, input_w_size,
+      patch_height, patch_width, input_row_base, input_column_base,
+      x_zero_point);
 }
 
 static int32_t reduce36(const int32_t value[36]) {
@@ -424,11 +360,13 @@ OutputBlockLoop:
       OutputTileColumnLoop:
         for (int ow_base = 0; ow_base < ow_size;
              ow_base += kOutputTileWidth) {
-          uint32_t packed_input[kPackedInputBufferWords];
+          uint32_t packed_input_bank0[kPackedInputBankWords];
+          uint32_t packed_input_bank1[kPackedInputBankWords];
           centered_t
               input_tile[kInputParallel][kInputTileHeight][kInputTileWidth];
           int32_t accum[kOutputBlock][kOutputTileHeight][kOutputTileWidth];
-#pragma HLS BIND_STORAGE variable = packed_input type = ram_s2p impl = uram
+#pragma HLS BIND_STORAGE variable = packed_input_bank0 type = ram_1p impl = uram
+#pragma HLS BIND_STORAGE variable = packed_input_bank1 type = ram_1p impl = uram
 #pragma HLS ARRAY_PARTITION variable = input_tile complete dim = 1
 #pragma HLS ARRAY_PARTITION variable = input_tile complete dim = 2
 #pragma HLS ARRAY_PARTITION variable = input_tile complete dim = 3
@@ -470,10 +408,10 @@ OutputBlockLoop:
           const int input_column_base = ow_base * stride_w - pad_left;
           const int input_channel_tiles = c_size / kInputParallel;
 
-// Prime bank zero. Subsequent iterations read/expand one address range while
-// filling the other through the SDP write port.
+// Prime bank zero. Subsequent iterations expand one physical bank while
+// DATAFLOW fills the other, then swap their roles.
         PrimePackedInputTile:
-          loadPackedInputTile(x, packed_input, 0, n, c_size, h_size,
+          loadPackedInputTile(x, packed_input_bank0, n, c_size, h_size,
               input_w_size, 0, patch_height, patch_width, input_row_base,
               input_column_base);
 
@@ -482,18 +420,32 @@ OutputBlockLoop:
                ++channel_tile) {
             const int c_base = channel_tile * kInputParallel;
             const int current_bank = channel_tile & 1;
-            const int next_bank = current_bank ^ 1;
             const bool has_next = channel_tile + 1 < input_channel_tiles;
 
             if (has_next) {
-              loadNextAndExpandCurrent(x, packed_input, current_bank,
-                  next_bank, input_tile, n, c_size, h_size, input_w_size,
-                  c_base + kInputParallel, patch_height, patch_width,
-                  input_row_base, input_column_base, x_zero_point);
+              if (current_bank == 0) {
+                loadNextAndExpandCurrent(x, packed_input_bank0,
+                    packed_input_bank1, input_tile, n, c_size, h_size,
+                    input_w_size, c_base + kInputParallel, patch_height,
+                    patch_width, input_row_base, input_column_base,
+                    x_zero_point);
+              } else {
+                loadNextAndExpandCurrent(x, packed_input_bank1,
+                    packed_input_bank0, input_tile, n, c_size, h_size,
+                    input_w_size, c_base + kInputParallel, patch_height,
+                    patch_width, input_row_base, input_column_base,
+                    x_zero_point);
+              }
             } else {
-              expandPackedInputTile(packed_input, current_bank, input_tile,
-                  h_size, input_w_size, patch_height, patch_width,
-                  input_row_base, input_column_base, x_zero_point);
+              if (current_bank == 0) {
+                expandPackedInputTile(packed_input_bank0, input_tile, h_size,
+                    input_w_size, patch_height, patch_width, input_row_base,
+                    input_column_base, x_zero_point);
+              } else {
+                expandPackedInputTile(packed_input_bank1, input_tile, h_size,
+                    input_w_size, patch_height, patch_width, input_row_base,
+                    input_column_base, x_zero_point);
+              }
             }
 
           OutputSubBlockLoop:
