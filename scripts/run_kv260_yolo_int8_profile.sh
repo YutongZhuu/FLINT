@@ -16,7 +16,23 @@ input="${1:-${script_dir}/bus-input-aarch64.bin}"
 output="${2:-${script_dir}/bus-output-aarch64.bin}"
 log="${3:-${script_dir}/yolo-profile.log}"
 driver="${script_dir}/yolo-int8-myaccel-driver-aarch64"
-xrt_ini="${MYACCEL_XRT_INI:-${script_dir}/xrt-profile.ini}"
+profile_preset="${MYACCEL_XRT_PROFILE_PRESET:-full}"
+if [[ -n "${MYACCEL_XRT_INI:-}" ]]; then
+  xrt_ini="${MYACCEL_XRT_INI}"
+else
+  case "${profile_preset}" in
+  host) xrt_ini="${script_dir}/xrt-host-profile.ini" ;;
+  counters) xrt_ini="${script_dir}/xrt-counters.ini" ;;
+  device-trace) xrt_ini="${script_dir}/xrt-device-trace.ini" ;;
+  stall-trace) xrt_ini="${script_dir}/xrt-stall-trace.ini" ;;
+  full) xrt_ini="${script_dir}/xrt-profile.ini" ;;
+  *)
+    echo "error: MYACCEL_XRT_PROFILE_PRESET must be host, counters, " \
+      "device-trace, stall-trace, or full, got: ${profile_preset}" >&2
+    exit 2
+    ;;
+  esac
+fi
 profile_dir="${MYACCEL_XRT_PROFILE_DIR:-${script_dir}/xrt-profile}"
 time_bin="${TIME_BIN:-/usr/bin/time}"
 
@@ -70,6 +86,18 @@ echo "Output: ${output}"
 echo "Log:    ${log}"
 echo "XRT INI:${XRT_INI_PATH}"
 echo "XRT out: ${profile_dir}"
+
+requires_device_trace=0
+if awk -F= '
+  /^[[:space:]]*device_trace[[:space:]]*=/ {
+    value = $2
+    gsub(/[[:space:]]/, "", value)
+    if (value != "" && value != "off") found = 1
+  }
+  END { exit(found ? 0 : 1) }
+' "${XRT_INI_PATH}"; then
+  requires_device_trace=1
+fi
 
 set +e
 (
@@ -131,10 +159,17 @@ if (( trace_artifact_count == 0 )); then
   echo "error: XRT did not produce a native, timeline, or device trace CSV" >&2
   exit 1
 fi
-if (( device_trace_count > 0 && device_trace_with_events == 0 )); then
+if (( requires_device_trace && device_trace_count > 0 && device_trace_with_events == 0 )); then
   echo "error: XRT device trace contains no events; use xrt-counters.ini " \
     "for a counter image, or rebuild the short-test image with " \
     "VITIS_PROFILE=trace" >&2
+  exit 1
+fi
+if (( requires_device_trace && device_trace_count == 0 )) && \
+   [[ ! -s "${profile_dir}/timeline_trace.csv" ]]; then
+  echo "error: the selected XRT profile requests device trace, but XRT " \
+    "produced no device trace artifact; rebuild the xclbin with " \
+    "VITIS_PROFILE=trace or VITIS_PROFILE=full" >&2
   exit 1
 fi
 

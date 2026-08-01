@@ -307,6 +307,25 @@ grep -Fq -- '--profile.data conv1x1_i8_kernel:conv1x1_i8_kernel_1:m_axi_gmem0:al
 grep -Fq -- '--profile.data conv3x3_i8_kernel:conv3x3_i8_kernel_1:m_axi_gmem0:all' "$call_log"
 grep -Fq -- '--profile.trace_memory FIFO:8K' "$call_log"
 
+: >"$call_log"
+PATH="$mock_bin:$PATH" \
+PLATFORM="$test_root/platform.xpfm" \
+TARGET=hw \
+VITIS_PROFILE=full \
+VITIS_INCLUDE_6X6_STEM=1 \
+VITIS_OUT_DIR="$test_root/full-profile-out" \
+VITIS_REPORT_DIR="$test_root/full-profile-report" \
+  ./hw/scripts/compile.sh >/dev/null
+grep -Fq -- '--profile.stall all:all:all' "$call_log"
+for kernel in conv1x1_i8_kernel conv3x3_i8_kernel conv6x6_stem_i8_kernel; do
+  for bundle in gmem0 gmem1 gmem2 gmem3; do
+    grep -Fq -- \
+      "--profile.data ${kernel}:${kernel}_1:m_axi_${bundle}:all" \
+      "$call_log"
+  done
+done
+grep -Fq -- '--profile.trace_memory FIFO:8K' "$call_log"
+
 PATH="$mock_bin:$PATH" \
 PLATFORM="$test_root/platform.xpfm" \
 TARGET=hw \
@@ -384,7 +403,7 @@ grep -Fq 'actual:   wrong-app.bit.bin' "$test_root/mismatch.stderr"
 profile_package=$test_root/profile-package
 mkdir -p "$profile_package/runtime-libs"
 cp scripts/run_kv260_yolo_int8_profile.sh "$profile_package/run-profile.sh"
-cp scripts/xrt-profile.ini "$profile_package/"
+cp scripts/xrt-*.ini "$profile_package/"
 printf 'mock xclbin\n' >"$profile_package/profile.xclbin"
 printf 'mock input\n' >"$profile_package/input.bin"
 cat >"$profile_package/yolo-int8-myaccel-driver-aarch64" <<'EOF'
@@ -434,6 +453,38 @@ test -s "$test_root/xrt-output/xrt.run_summary"
 test -s "$test_root/xrt-output/summary.csv"
 test -s "$test_root/xrt-output/native_trace.csv"
 test -s "$test_root/xrt-output/device_trace_0.csv"
+
+(
+  cd "$test_root"
+  MYACCEL_XCLBIN="$profile_package/profile.xclbin" \
+  MYACCEL_XRT_PROFILE_PRESET=device-trace \
+  MYACCEL_XRT_PROFILE_DIR="$test_root/xrt-output-device-preset" \
+  TIME_BIN="$mock_bin/time" \
+    "$profile_package/run-profile.sh" \
+      "$profile_package/input.bin" \
+      device-preset-output.bin \
+      device-preset-profile.log >/dev/null
+)
+test -s "$test_root/xrt-output-device-preset/device_trace_0.csv"
+
+if (
+  cd "$test_root"
+  MYACCEL_XCLBIN="$profile_package/profile.xclbin" \
+  MYACCEL_XRT_PROFILE_PRESET=invalid \
+  MYACCEL_XRT_PROFILE_DIR="$test_root/xrt-output-invalid-preset" \
+  TIME_BIN="$mock_bin/time" \
+    "$profile_package/run-profile.sh" \
+      "$profile_package/input.bin" \
+      invalid-preset-output.bin \
+      invalid-preset-profile.log \
+      >"$test_root/invalid-preset.stdout" \
+      2>"$test_root/invalid-preset.stderr"
+); then
+  echo "error: invalid XRT profile preset unexpectedly passed" >&2
+  exit 1
+fi
+grep -Fq 'MYACCEL_XRT_PROFILE_PRESET must be' \
+  "$test_root/invalid-preset.stderr"
 
 # Output and log paths are allowed inside the freshly and atomically created
 # profile directory. Their parent directories must be created only after the

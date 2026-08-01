@@ -35,9 +35,9 @@ case "$profile_mode" in
   # that offload path.
   profile_mode=counters
   ;;
-trace) ;;
+trace|full) ;;
 *)
-  echo "error: VITIS_PROFILE must be 0, 1, counters, or trace, got: $profile_mode" >&2
+  echo "error: VITIS_PROFILE must be 0, 1, counters, trace, or full, got: $profile_mode" >&2
   exit 2
   ;;
 esac
@@ -144,6 +144,31 @@ xclbin="$out_dir/conv_int8_only.$target.xclbin"
 compile_profile_args=()
 link_profile_args=()
 link_export_args=()
+
+add_data_profile_monitors() {
+  local detail=$1
+  local all_ports=$2
+  local kernel=
+  local bundle=
+  local kernels=(conv1x1_i8_kernel conv3x3_i8_kernel)
+  local bundles=(gmem0)
+
+  if [ "$include_6x6_stem" = "1" ]; then
+    kernels+=(conv6x6_stem_i8_kernel)
+  fi
+  if [ "$all_ports" = "1" ]; then
+    bundles+=(gmem1 gmem2 gmem3)
+  fi
+
+  for kernel in "${kernels[@]}"; do
+    for bundle in "${bundles[@]}"; do
+      link_profile_args+=(
+        --profile.data "${kernel}:${kernel}_1:m_axi_${bundle}:${detail}"
+      )
+    done
+  done
+}
+
 if [ "$profile_mode" != "0" ]; then
   # Stall ports must be enabled while compiling each kernel. A stall monitor
   # also supplies execution counters, so a second --profile.exec monitor is
@@ -155,22 +180,24 @@ if [ "$profile_mode" = "counters" ]; then
   # Monitoring every bundle creates sixteen AIMs on this platform because each
   # logical port expands across HP and HP1, which is unnecessary for locating
   # the activation-loader bottleneck.
-  link_profile_args+=(
-    --profile.stall all:all:counters
-    --profile.data conv1x1_i8_kernel:conv1x1_i8_kernel_1:m_axi_gmem0:counters
-    --profile.data conv3x3_i8_kernel:conv3x3_i8_kernel_1:m_axi_gmem0:counters
-  )
-elif [ "$profile_mode" = "trace" ]; then
+  link_profile_args+=(--profile.stall all:all:counters)
+  add_data_profile_monitors counters 0
+elif [ "$profile_mode" = "trace" ] || [ "$profile_mode" = "full" ]; then
   # The platform has no DPA_TRACE_SLAVE decoration. Vitis 2022.1 otherwise
   # chooses a PS HP port and fails while inserting the trace offload path. A
   # small on-chip FIFO avoids that platform bug; use this image only for short
   # one-layer host tests because a full-network trace can overflow 8 KiB.
-  link_profile_args+=(
-    --profile.stall all:all:all
-    --profile.data conv1x1_i8_kernel:conv1x1_i8_kernel_1:m_axi_gmem0:all
-    --profile.data conv3x3_i8_kernel:conv3x3_i8_kernel_1:m_axi_gmem0:all
-    --profile.trace_memory FIFO:8K
-  )
+  link_profile_args+=(--profile.stall all:all:all)
+  if [ "$profile_mode" = "full" ]; then
+    # Full profiling accounts for activation, weight, bias, and output traffic.
+    # It deliberately lives behind a separate mode because the extra AXI
+    # monitors consume PL resources and may affect timing. Confirm fit using
+    # the routed utilization/timing reports from this exact image.
+    add_data_profile_monitors all 1
+  else
+    add_data_profile_monitors all 0
+  fi
+  link_profile_args+=(--profile.trace_memory FIFO:8K)
 fi
 if [ "$target" = "hw" ]; then
   # Keep the post-link XSA so the DTBO can be generated from the exact routed
@@ -291,6 +318,8 @@ if [ "$profile_mode" = "counters" ]; then
   printf 'XRT profiling instrumentation: activation data and stall counters\n'
 elif [ "$profile_mode" = "trace" ]; then
   printf 'XRT profiling instrumentation: activation/stall trace in 8 KiB FIFO\n'
+elif [ "$profile_mode" = "full" ]; then
+  printf 'XRT profiling instrumentation: all AXI ports and stalls in 8 KiB FIFO\n'
 fi
 
 if [ "$target" = "hw" ]; then

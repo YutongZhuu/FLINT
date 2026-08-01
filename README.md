@@ -542,7 +542,19 @@ adds aggregate activation-bandwidth and CU-stall counters. The Vitis 2022.1
 KV260 platform used here has no trace-master decoration, so full DDR-backed
 device trace insertion fails before synthesis. `VITIS_PROFILE=trace` instead
 uses an 8 KiB on-chip FIFO and is intended only for the short standalone XRT
-tests, not a complete YOLO inference.
+tests, not a complete YOLO inference. It monitors the activation port only.
+
+For maximum board visibility, build a separate full-profile image:
+
+```sh
+VITIS_PROFILE=full scripts/build_kv260_int8_only_xclbin.sh
+```
+
+`full` records CU execution/stalls and all four AXI interfaces of every linked
+kernel: activation (`gmem0`), weights (`gmem1`), bias (`gmem2`), and output
+(`gmem3`). These monitors consume PL resources and can perturb timing, so use
+the resulting routed timing/utilization reports to determine whether this
+diagnostic image fits. Do not use its QoR as the production-kernel baseline.
 
 Each hardware build collects `csynth.rpt` for every included kernel plus
 post-route timing, flat and hierarchical utilization, and estimated power.
@@ -665,21 +677,43 @@ The summary includes:
 - total instrumented time
 - total process wall/CPU time
 
-For a KV260 run, select the XRT configuration that matches the linked image:
+For a KV260 run, select the XRT configuration that matches the linked image.
+The runner accepts a preset, creates a fresh artifact directory, and rejects a
+requested device trace when XRT produces no device-side events:
 
 ```sh
 # No device monitors: host XRT API timeline plus MYACCEL per-layer timings.
-MYACCEL_XRT_INI=$PWD/scripts/xrt-host-profile.ini \
+MYACCEL_XRT_PROFILE_PRESET=host \
   scripts/run_kv260_yolo_int8_profile.sh
 
 # VITIS_PROFILE=counters image: add aggregate device bandwidth/stall counters.
-MYACCEL_XRT_INI=$PWD/scripts/xrt-counters.ini \
+MYACCEL_XRT_PROFILE_PRESET=counters \
   scripts/run_kv260_yolo_int8_profile.sh
 
-# VITIS_PROFILE=trace image: one short HostXrtConvTest invocation only.
+# VITIS_PROFILE=trace/full image: device timeline without stall events.
+MYACCEL_XRT_PROFILE_PRESET=device-trace \
+  scripts/run_kv260_yolo_int8_profile.sh
+
+# VITIS_PROFILE=trace/full image: device timeline plus all stall events.
+MYACCEL_XRT_PROFILE_PRESET=stall-trace \
+  scripts/run_kv260_yolo_int8_profile.sh
+
+# Maximum-detail one-kernel capture using a VITIS_PROFILE=full image.
 XRT_INI_PATH=$PWD/scripts/xrt-profile.ini \
   ./host_xrt_int8_test ./conv_int8_only.hw.xclbin --int8-3x3-only
 ```
+
+Open `xrt.run_summary` in `vitis_analyzer`. The Application Timeline separates
+host/XRT delay from kernel execution; Device Hardware Transactions show AXI
+activity and overlap; Profile Summary reports per-port bytes, transactions,
+latency, and bandwidth; and stall events show memory/dataflow blocking.
+
+This is the most detailed non-invasive board profile, but it is not a waveform
+of every internal register. To prove that the two activation banks overlap as
+intended, also inspect the generated HLS schedule/dataflow report or run C/RTL
+co-simulation with waveform capture for `conv3x3_i8_kernel`. Use the board XRT
+trace to measure external traffic and stalls, and the HLS/RTL view to inspect
+the loader/compute bank handoff cycle by cycle.
 
 Set `MYACCEL_XRT_PROFILE_DIR` to a new, nonexistent directory for each full
 profile. The runner atomically creates that directory and rejects a competing
