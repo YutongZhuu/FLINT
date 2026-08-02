@@ -143,8 +143,10 @@ LoadPackedInputLaneLoop:
 }
 
 // Expand one packed staging-bank into the fully-partitioned register window.
-// Keeping this conversion separate from the AXI loop removes conditional DDR
-// reads while preserving the 36 scalar activation reads needed by compute.
+// Keep this conversion separate from the AXI loop so DDR reads remain burstable.
+// Iterate over valid scalar bytes instead of pipelining a packed-word loop with
+// an unrolled, condition-heavy byte loop. Vitis 2022.1 spends an excessive
+// amount of time scheduling the latter when input_tile is fully partitioned.
 static void expandPackedInputTile(
     const uint32_t packed_input[kPackedInputBankWords],
     centered_t input_tile[kInputParallel][kInputTileHeight][kInputTileWidth],
@@ -169,40 +171,35 @@ static void expandPackedInputTile(
       has_valid_region
           ? first_valid_column & ~(kPackedBytes - 1)
           : 0;
-  const int last_word_column =
-      has_valid_region
-          ? last_valid_column & ~(kPackedBytes - 1)
-          : -kPackedBytes;
-  const int valid_word_count =
-      has_valid_region
-          ? (last_word_column - first_word_column) / kPackedBytes + 1
-          : 0;
+  const int first_local_column =
+      has_valid_region ? first_valid_column - input_column_base : 0;
+  const int patch_last_local_column =
+      has_valid_region ? last_valid_column - input_column_base : -1;
+  const int tile_last_local_column =
+      patch_width < kInputTileWidth ? patch_width - 1
+                                    : kInputTileWidth - 1;
+  const int last_local_column =
+      patch_last_local_column < tile_last_local_column
+          ? patch_last_local_column
+          : tile_last_local_column;
 
 ExpandInputLaneLoop:
   for (int input_lane = 0; input_lane < kInputParallel; ++input_lane) {
   ExpandInputRowLoop:
     for (int local_ih = first_local_row; local_ih < last_local_row;
          ++local_ih) {
-    ExpandInputWordLoop:
-      for (int word_offset = 0; word_offset < valid_word_count;
-           ++word_offset) {
+    ExpandInputColumnLoop:
+      for (int local_iw = first_local_column;
+           local_iw <= last_local_column; ++local_iw) {
 #pragma HLS PIPELINE II = 1
+        const int iw = input_column_base + local_iw;
+        const int packed_word = (iw - first_word_column) / kPackedBytes;
+        const int byte_lane = (iw - first_word_column) & (kPackedBytes - 1);
         const uint32_t packed_value =
-            packed_input[packedInputIndex(input_lane, local_ih, word_offset)];
-      ExpandInputByteLoop:
-        for (int byte_lane = 0; byte_lane < kPackedBytes; ++byte_lane) {
-#pragma HLS UNROLL
-          const int iw = first_word_column + word_offset * kPackedBytes +
-                         byte_lane;
-          const int local_iw = iw - input_column_base;
-          if (iw >= first_valid_column && iw <= last_valid_column &&
-              local_iw >= 0 && local_iw < patch_width &&
-              local_iw < kInputTileWidth) {
-            input_tile[input_lane][local_ih][local_iw] =
-                (centered_t)((int32_t)unpackInt8(packed_value, byte_lane) -
-                             x_zero_point);
-          }
-        }
+            packed_input[packedInputIndex(input_lane, local_ih, packed_word)];
+        input_tile[input_lane][local_ih][local_iw] =
+            (centered_t)((int32_t)unpackInt8(packed_value, byte_lane) -
+                         x_zero_point);
       }
     }
   }
