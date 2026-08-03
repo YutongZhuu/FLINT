@@ -128,7 +128,7 @@ extern "C" void conv3x3_i8_kernel(const uint32_t *x,
     uint32_t requant_multiplier_bits, int output_zero_point) {
 #pragma HLS INTERFACE m_axi port = x offset = slave bundle = gmem0 \
     max_read_burst_length = 8 num_read_outstanding = 8 \
-    alignment_byte_size = 16 max_widen_bitwidth = 128
+    max_widen_bitwidth = 128
 #pragma HLS INTERFACE m_axi port = weight offset = slave bundle = gmem1 \
     max_read_burst_length = 64 num_read_outstanding = 16
 #pragma HLS INTERFACE m_axi port = bias offset = slave bundle = gmem2 \
