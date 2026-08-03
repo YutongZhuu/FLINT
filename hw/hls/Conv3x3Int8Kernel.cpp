@@ -3,10 +3,6 @@
 
 #include <stdint.h>
 
-#ifdef __SYNTHESIS__
-#include <ap_int.h>
-#endif
-
 namespace {
 
 constexpr int kInputParallel = 4;
@@ -24,6 +20,7 @@ constexpr int kOutputStripeWidth =
     MYACCEL_CONV3X3_INT8_OUTPUT_STRIPE_WIDTH;
 constexpr int kPackedBytes = 4;
 constexpr int kAxiInputBytes = MYACCEL_CONV3X3_INT8_INPUT_AXI_BITS / 8;
+constexpr int kPackedWordsPerAxiBeat = kAxiInputBytes / kPackedBytes;
 constexpr int kKernelElements = 3 * 3;
 constexpr int kWeightWordsPerInputGroup =
     kInputParallel * kKernelElements / kPackedBytes;
@@ -38,6 +35,8 @@ constexpr int kMaxInputStripeWidth =
 constexpr int kInputStripeWords =
     (kMaxInputStripeWidth + kAxiInputBytes - 1 + kPackedBytes - 1) /
     kPackedBytes;
+constexpr int kInputStripeBeats =
+    kInputStripeWords / kPackedWordsPerAxiBeat;
 constexpr int kReshapedWeightDepth =
     (kOutputBlock / kOutputParallel) *
     (MYACCEL_CONV3X3_INT8_MAX_INPUT_CHANNELS / kInputParallel);
@@ -53,6 +52,10 @@ static_assert(kOutputStripeWidth % kOutputTileWidth == 0,
     "an AXI stripe must contain complete compute tiles");
 static_assert(kInputStripeWords == 20,
     "the maximum aligned stride-two stripe must occupy 80 bytes");
+static_assert(kInputStripeWords % kPackedWordsPerAxiBeat == 0,
+    "the aligned input stripe must contain complete AXI beats");
+static_assert(kInputStripeBeats == 5,
+    "the maximum aligned stride-two stripe must occupy five AXI beats");
 // The checked-in csynth report maps each 256-bit weight plane to four URAMs
 // (4096 rows) and accum to eight BRAM18s (512 rows). Keep the increased
 // logical depths inside those already-paid physical depths. A fresh csynth is
@@ -64,9 +67,52 @@ static_assert(kReshapedAccumDepth <= 512,
 
 #ifdef __SYNTHESIS__
 using centered_t = ap_int<9>;
+using input_beat_t = myaccel_conv3x3_i8_input_axi_t;
 #else
 using centered_t = int16_t;
+struct input_beat_t {
+  uint32_t word[kPackedWordsPerAxiBeat];
+};
 #endif
+
+static input_beat_t loadInputBeat(
+    const myaccel_conv3x3_i8_input_axi_t *x, uint32_t beat_index,
+    uint32_t total_input_beats) {
+#pragma HLS INLINE
+  input_beat_t beat = {};
+  if (beat_index >= total_input_beats)
+    return beat;
+#ifdef __SYNTHESIS__
+  beat = x[beat_index];
+#else
+LoadNativeInputBeatWordLoop:
+  for (int word_lane = 0; word_lane < kPackedWordsPerAxiBeat; ++word_lane) {
+#pragma HLS UNROLL
+    beat.word[word_lane] =
+        x[beat_index * kPackedWordsPerAxiBeat + word_lane];
+  }
+#endif
+  return beat;
+}
+
+static uint32_t unpackInputBeatWord(
+    const input_beat_t &beat, int word_lane) {
+#pragma HLS INLINE
+#ifdef __SYNTHESIS__
+  switch (word_lane) {
+  case 0:
+    return (uint32_t)beat.range(31, 0);
+  case 1:
+    return (uint32_t)beat.range(63, 32);
+  case 2:
+    return (uint32_t)beat.range(95, 64);
+  default:
+    return (uint32_t)beat.range(127, 96);
+  }
+#else
+  return beat.word[word_lane];
+#endif
+}
 
 static int32_t dspMultiply(centered_t lhs, centered_t rhs) {
 #pragma HLS INLINE
@@ -120,15 +166,15 @@ ReduceLevel2Loop:
 
 } // namespace
 
-extern "C" void conv3x3_i8_kernel(const uint32_t *x,
+extern "C" void conv3x3_i8_kernel(
+    const myaccel_conv3x3_i8_input_axi_t *x,
     const uint32_t *weight, const int32_t *bias, uint32_t *output,
     int n_size, int c_size, int h_size, int input_w_size, int m_size,
     int oh_size, int ow_size, int pad_left, int pad_top, int stride_h,
     int stride_w, int x_zero_point, int w_zero_point,
     uint32_t requant_multiplier_bits, int output_zero_point) {
 #pragma HLS INTERFACE m_axi port = x offset = slave bundle = gmem0 \
-    max_read_burst_length = 8 num_read_outstanding = 8 \
-    max_widen_bitwidth = 128
+    max_read_burst_length = 8 num_read_outstanding = 8
 #pragma HLS INTERFACE m_axi port = weight offset = slave bundle = gmem1 \
     max_read_burst_length = 64 num_read_outstanding = 16
 #pragma HLS INTERFACE m_axi port = bias offset = slave bundle = gmem2 \
@@ -229,8 +275,8 @@ OutputBlockLoop:
       OutputStripeColumnLoop:
         for (int ow_base = 0; ow_base < ow_size;
              ow_base += kOutputStripeWidth) {
-          uint32_t input_stripe[kInputParallel * kInputTileHeight]
-                               [kInputStripeWords];
+          input_beat_t input_stripe[kInputParallel * kInputTileHeight]
+                                   [kInputStripeBeats];
           centered_t
               input_tile[kInputParallel][kInputTileHeight][kInputTileWidth];
           int32_t accum[kOutputBlock][kOutputTileHeight][kOutputStripeWidth];
@@ -279,9 +325,9 @@ OutputBlockLoop:
                 (valid_stripe_ow - 1) * stride_w + 3;
             const int input_row_base = oh_base * stride_h - pad_top;
             const int input_column_base = ow_base * stride_w - pad_left;
-            const uint32_t total_input_words =
+            const uint32_t total_input_beats =
                 (uint32_t)n_size * c_size * h_size * input_w_size /
-                kPackedBytes;
+                kAxiInputBytes;
 
           LoadInputStripeChannelLoop:
             for (int input_lane = 0; input_lane < kInputParallel;
@@ -315,23 +361,23 @@ OutputBlockLoop:
                       first_global_byte & ~(uint32_t)(kAxiInputBytes - 1);
                   const uint32_t last_global_byte =
                       row_byte_index + valid_last_iw;
-                  const int stripe_words_to_read =
+                  const int stripe_beats_to_read =
                       (int)((last_global_byte - aligned_global_byte) /
-                                kPackedBytes +
+                                kAxiInputBytes +
                             1);
-                  const uint32_t aligned_global_word =
-                      aligned_global_byte / kPackedBytes;
+                  const uint32_t aligned_global_beat =
+                      aligned_global_byte / kAxiInputBytes;
                   const int stripe_row =
                       input_lane * kInputTileHeight + local_ih;
 
-                LoadInputStripeWordLoop:
-                  for (int stripe_word = 0;
-                       stripe_word < stripe_words_to_read; ++stripe_word) {
+                LoadInputStripeBeatLoop:
+                  for (int stripe_beat = 0;
+                       stripe_beat < stripe_beats_to_read; ++stripe_beat) {
 #pragma HLS PIPELINE II = 1
-                    const uint32_t global_word =
-                        aligned_global_word + stripe_word;
-                    input_stripe[stripe_row][stripe_word] =
-                        global_word < total_input_words ? x[global_word] : 0;
+                    const uint32_t global_beat =
+                        aligned_global_beat + stripe_beat;
+                    input_stripe[stripe_row][stripe_beat] =
+                        loadInputBeat(x, global_beat, total_input_beats);
                   }
                 }
               }
@@ -409,21 +455,32 @@ OutputBlockLoop:
                       second_word_global_byte =
                           (row_byte_index + valid_last_iw) &
                           ~(uint32_t)(kPackedBytes - 1);
-                      const int first_word_index =
+                      const int first_beat_index =
                           (int)((first_word_global_byte -
                                     stripe_aligned_global_byte) /
-                                kPackedBytes);
-                      const int second_word_index =
+                                kAxiInputBytes);
+                      const int second_beat_index =
                           (int)((second_word_global_byte -
                                     stripe_aligned_global_byte) /
-                                kPackedBytes);
+                                kAxiInputBytes);
+                      const int first_word_lane =
+                          (first_word_global_byte / kPackedBytes) &
+                          (kPackedWordsPerAxiBeat - 1);
+                      const int second_word_lane =
+                          (second_word_global_byte / kPackedBytes) &
+                          (kPackedWordsPerAxiBeat - 1);
                       const int stripe_row =
                           input_lane * kInputTileHeight + local_ih;
-                      first_word = input_stripe[stripe_row][first_word_index];
-                      second_word = second_word_index == first_word_index
-                                        ? first_word
-                                        : input_stripe[stripe_row]
-                                                      [second_word_index];
+                      first_word = unpackInputBeatWord(
+                          input_stripe[stripe_row][first_beat_index],
+                          first_word_lane);
+                      second_word =
+                          second_word_global_byte == first_word_global_byte
+                              ? first_word
+                              : unpackInputBeatWord(
+                                    input_stripe[stripe_row]
+                                                [second_beat_index],
+                                    second_word_lane);
                     }
 
                   ScatterInputByteLoop:
