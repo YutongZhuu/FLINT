@@ -45,3 +45,5 @@ mkdir -p "$out_dir"
   -o "$int8_test_exe"
 
 "$int8_test_exe"
+
+./tests/test_conv3x3_int8_stripe_contract.sh

@@ -11,10 +11,19 @@ namespace {
 
 constexpr int kInputParallel = 4;
 constexpr int kOutputParallel = 8;
-constexpr int kOutputBlock = 16;
+// Keep the measured 32-output-channel YOLO layer in one spatial-tile pass.
+// The eight-lane MAC datapath is unchanged; this only retains four output
+// sub-blocks so each loaded activation tile is reused across all 32 outputs.
+constexpr int kOutputBlock = 32;
 constexpr int kOutputTileHeight = 2;
 constexpr int kOutputTileWidth = 8;
+// Fetch four adjacent compute tiles as one AXI stripe. The compute tile stays
+// eight columns wide so its fully-partitioned register window and MAC fanout do
+// not grow with the memory transaction size.
+constexpr int kOutputStripeWidth =
+    MYACCEL_CONV3X3_INT8_OUTPUT_STRIPE_WIDTH;
 constexpr int kPackedBytes = 4;
+constexpr int kAxiInputBytes = MYACCEL_CONV3X3_INT8_INPUT_AXI_BITS / 8;
 constexpr int kKernelElements = 3 * 3;
 constexpr int kWeightWordsPerInputGroup =
     kInputParallel * kKernelElements / kPackedBytes;
@@ -22,6 +31,36 @@ constexpr int kInputTileHeight =
     (kOutputTileHeight - 1) * MYACCEL_CONV3X3_INT8_MAX_STRIDE + 3;
 constexpr int kInputTileWidth =
     (kOutputTileWidth - 1) * MYACCEL_CONV3X3_INT8_MAX_STRIDE + 3;
+constexpr int kMaxInputStripeWidth =
+    (kOutputStripeWidth - 1) * MYACCEL_CONV3X3_INT8_MAX_STRIDE + 3;
+// A 65-byte stride-two patch can begin 15 bytes after a 128-bit boundary.
+// Twenty packed words retain the complete aligned 80-byte region.
+constexpr int kInputStripeWords =
+    (kMaxInputStripeWidth + kAxiInputBytes - 1 + kPackedBytes - 1) /
+    kPackedBytes;
+constexpr int kReshapedWeightDepth =
+    (kOutputBlock / kOutputParallel) *
+    (MYACCEL_CONV3X3_INT8_MAX_INPUT_CHANNELS / kInputParallel);
+constexpr int kReshapedAccumDepth =
+    (kOutputBlock / kOutputParallel) * kOutputTileHeight *
+    kOutputStripeWidth;
+
+static_assert(kOutputBlock == 32,
+    "the first 32-output YOLO layer must use one activation-tile pass");
+static_assert(kOutputBlock % kOutputParallel == 0,
+    "the output block must contain complete compute-lane groups");
+static_assert(kOutputStripeWidth % kOutputTileWidth == 0,
+    "an AXI stripe must contain complete compute tiles");
+static_assert(kInputStripeWords == 20,
+    "the maximum aligned stride-two stripe must occupy 80 bytes");
+// The checked-in csynth report maps each 256-bit weight plane to four URAMs
+// (4096 rows) and accum to eight BRAM18s (512 rows). Keep the increased
+// logical depths inside those already-paid physical depths. A fresh csynth is
+// still the gate before spending time on implementation.
+static_assert(kReshapedWeightDepth <= 4096,
+    "the reshaped weight cache would require another URAM depth row");
+static_assert(kReshapedAccumDepth <= 512,
+    "the reshaped accumulator would require another BRAM depth row");
 
 #ifdef __SYNTHESIS__
 using centered_t = ap_int<9>;
@@ -88,7 +127,8 @@ extern "C" void conv3x3_i8_kernel(const uint32_t *x,
     int stride_w, int x_zero_point, int w_zero_point,
     uint32_t requant_multiplier_bits, int output_zero_point) {
 #pragma HLS INTERFACE m_axi port = x offset = slave bundle = gmem0 \
-    max_read_burst_length = 64 num_read_outstanding = 16
+    max_read_burst_length = 8 num_read_outstanding = 8 \
+    alignment_byte_size = 16 max_widen_bitwidth = 128
 #pragma HLS INTERFACE m_axi port = weight offset = slave bundle = gmem1 \
     max_read_burst_length = 64 num_read_outstanding = 16
 #pragma HLS INTERFACE m_axi port = bias offset = slave bundle = gmem2 \
@@ -129,6 +169,13 @@ extern "C" void conv3x3_i8_kernel(const uint32_t *x,
 
 OutputBlockLoop:
   for (int m_block = 0; m_block < m_size; m_block += kOutputBlock) {
+    const int remaining_outputs = m_size - m_block;
+    const int active_output_count = remaining_outputs < kOutputBlock
+                                        ? remaining_outputs
+                                        : kOutputBlock;
+    const int active_output_span =
+        ((active_output_count + kOutputParallel - 1) / kOutputParallel) *
+        kOutputParallel;
     uint32_t weight_cache[kOutputBlock]
                          [MYACCEL_CONV3X3_INT8_MAX_INPUT_CHANNELS /
                              kInputParallel]
@@ -145,14 +192,14 @@ OutputBlockLoop:
 #pragma HLS ARRAY_PARTITION variable = bias_cache complete
 
   LoadBiasLoop:
-    for (int local_m = 0; local_m < kOutputBlock; ++local_m) {
+    for (int local_m = 0; local_m < active_output_span; ++local_m) {
 #pragma HLS PIPELINE II = 1
       const int m = m_block + local_m;
       bias_cache[local_m] = m < m_size ? bias[m] : 0;
     }
 
   LoadWeightOutputLoop:
-    for (int local_m = 0; local_m < kOutputBlock; ++local_m) {
+    for (int local_m = 0; local_m < active_output_span; ++local_m) {
       const int m = m_block + local_m;
     LoadWeightInputGroupLoop:
       for (int input_group = 0; input_group < c_size / kInputParallel;
@@ -179,12 +226,15 @@ OutputBlockLoop:
     OutputTileRowLoop:
       for (int oh_base = 0; oh_base < oh_size;
            oh_base += kOutputTileHeight) {
-      OutputTileColumnLoop:
+      OutputStripeColumnLoop:
         for (int ow_base = 0; ow_base < ow_size;
-             ow_base += kOutputTileWidth) {
+             ow_base += kOutputStripeWidth) {
+          uint32_t input_stripe[kInputParallel * kInputTileHeight]
+                               [kInputStripeWords];
           centered_t
               input_tile[kInputParallel][kInputTileHeight][kInputTileWidth];
-          int32_t accum[kOutputBlock][kOutputTileHeight][kOutputTileWidth];
+          int32_t accum[kOutputBlock][kOutputTileHeight][kOutputStripeWidth];
+#pragma HLS BIND_STORAGE variable = input_stripe type = ram_2p impl = bram
 #pragma HLS ARRAY_PARTITION variable = input_tile complete dim = 1
 #pragma HLS ARRAY_PARTITION variable = input_tile complete dim = 2
 #pragma HLS ARRAY_PARTITION variable = input_tile complete dim = 3
@@ -195,12 +245,13 @@ OutputBlockLoop:
 #pragma HLS BIND_STORAGE variable = accum type = ram_2p impl = bram
 
         InitAccumOutputGroupLoop:
-          for (int output_base = 0; output_base < kOutputBlock;
+          for (int output_base = 0; output_base < active_output_span;
                output_base += kOutputParallel) {
           InitAccumRowLoop:
             for (int local_oh = 0; local_oh < kOutputTileHeight; ++local_oh) {
             InitAccumColumnLoop:
-              for (int local_ow = 0; local_ow < kOutputTileWidth; ++local_ow) {
+              for (int local_ow = 0; local_ow < kOutputStripeWidth;
+                   ++local_ow) {
 #pragma HLS PIPELINE II = 1
               InitAccumLaneLoop:
                 for (int output_lane = 0;
@@ -220,162 +271,257 @@ OutputBlockLoop:
             const int valid_oh = remaining_oh < kOutputTileHeight
                                      ? remaining_oh
                                      : kOutputTileHeight;
-            const int valid_ow = remaining_ow < kOutputTileWidth
-                                     ? remaining_ow
-                                     : kOutputTileWidth;
-            const int patch_height = (valid_oh - 1) * stride_h + 3;
-            const int patch_width = (valid_ow - 1) * stride_w + 3;
+            const int valid_stripe_ow = remaining_ow < kOutputStripeWidth
+                                            ? remaining_ow
+                                            : kOutputStripeWidth;
+            const int stripe_patch_height = (valid_oh - 1) * stride_h + 3;
+            const int stripe_patch_width =
+                (valid_stripe_ow - 1) * stride_w + 3;
             const int input_row_base = oh_base * stride_h - pad_top;
             const int input_column_base = ow_base * stride_w - pad_left;
+            const uint32_t total_input_words =
+                (uint32_t)n_size * c_size * h_size * input_w_size /
+                kPackedBytes;
 
-          LoadInputChannelLoop:
+          LoadInputStripeChannelLoop:
             for (int input_lane = 0; input_lane < kInputParallel;
                  ++input_lane) {
               const int c = c_base + input_lane;
-            LoadInputRowLoop:
+            LoadInputStripeRowLoop:
               for (int local_ih = 0; local_ih < kInputTileHeight;
                    ++local_ih) {
-              LoadInputWordGroupLoop:
-                for (int local_iw_base = 0;
-                     local_iw_base < kInputTileWidth;
-                     local_iw_base += kPackedBytes) {
+                const int ih = input_row_base + local_ih;
+                const bool valid_row = c < c_size &&
+                                       local_ih < stripe_patch_height &&
+                                       ih >= 0 && ih < h_size;
+                const int stripe_last_iw =
+                    input_column_base + stripe_patch_width - 1;
+                const int valid_first_iw =
+                    input_column_base < 0 ? 0 : input_column_base;
+                const int valid_last_iw = stripe_last_iw >= input_w_size
+                                              ? input_w_size - 1
+                                              : stripe_last_iw;
+                const bool has_valid_columns =
+                    valid_first_iw <= valid_last_iw &&
+                    valid_first_iw < input_w_size && valid_last_iw >= 0;
+
+                if (valid_row && has_valid_columns) {
+                  const uint32_t row_byte_index =
+                      ((uint32_t)n * c_size + c) * h_size * input_w_size +
+                      (uint32_t)ih * input_w_size;
+                  const uint32_t first_global_byte =
+                      row_byte_index + valid_first_iw;
+                  const uint32_t aligned_global_byte =
+                      first_global_byte & ~(uint32_t)(kAxiInputBytes - 1);
+                  const uint32_t last_global_byte =
+                      row_byte_index + valid_last_iw;
+                  const int stripe_words_to_read =
+                      (int)((last_global_byte - aligned_global_byte) /
+                                kPackedBytes +
+                            1);
+                  const uint32_t aligned_global_word =
+                      aligned_global_byte / kPackedBytes;
+                  const int stripe_row =
+                      input_lane * kInputTileHeight + local_ih;
+
+                LoadInputStripeWordLoop:
+                  for (int stripe_word = 0;
+                       stripe_word < stripe_words_to_read; ++stripe_word) {
 #pragma HLS PIPELINE II = 1
-                  const int ih = input_row_base + local_ih;
-                  const int group_first_iw =
-                      input_column_base + local_iw_base;
-                  const int remaining_patch_columns =
-                      patch_width - local_iw_base;
-                  const int active_group_bytes =
-                      remaining_patch_columns <= 0
-                          ? 0
-                          : (remaining_patch_columns < kPackedBytes
-                                    ? remaining_patch_columns
-                                    : kPackedBytes);
-                  const int group_last_iw =
-                      group_first_iw + active_group_bytes - 1;
-                  const int valid_first_iw =
-                      group_first_iw < 0 ? 0 : group_first_iw;
-                  const int valid_last_iw = group_last_iw >= input_w_size
-                                                ? input_w_size - 1
-                                                : group_last_iw;
-                  const bool valid_row = c < c_size &&
-                                         local_ih < patch_height && ih >= 0 &&
-                                         ih < h_size;
-                  const bool has_valid_columns =
-                      active_group_bytes > 0 &&
-                      valid_first_iw <= valid_last_iw &&
-                      valid_first_iw < input_w_size && valid_last_iw >= 0;
-
-                  uint32_t first_word = 0;
-                  uint32_t second_word = 0;
-                  int first_word_column = 0;
-                  int second_word_column = 0;
-                  if (valid_row && has_valid_columns) {
-                    first_word_column = valid_first_iw & ~(kPackedBytes - 1);
-                    second_word_column = valid_last_iw & ~(kPackedBytes - 1);
-                    const uint32_t row_byte_index =
-                        ((uint32_t)n * c_size + c) * h_size * input_w_size +
-                        (uint32_t)ih * input_w_size;
-                    const uint32_t row_word_index =
-                        row_byte_index / kPackedBytes;
-                    first_word =
-                        x[row_word_index + first_word_column / kPackedBytes];
-                    second_word =
-                        second_word_column == first_word_column
-                            ? first_word
-                            : x[row_word_index +
-                                second_word_column / kPackedBytes];
-                  }
-
-                ScatterInputByteLoop:
-                  for (int byte_lane = 0; byte_lane < kPackedBytes;
-                       ++byte_lane) {
-#pragma HLS UNROLL
-                    const int local_iw = local_iw_base + byte_lane;
-                    const int iw = group_first_iw + byte_lane;
-                    if (local_iw < kInputTileWidth) {
-                      if (valid_row && local_iw < patch_width && iw >= 0 &&
-                          iw < input_w_size) {
-                        const int word_column =
-                            iw & ~(kPackedBytes - 1);
-                        const uint32_t packed_input =
-                            word_column == first_word_column ? first_word
-                                                             : second_word;
-                        input_tile[input_lane][local_ih][local_iw] =
-                            (centered_t)((int32_t)unpackInt8(
-                                             packed_input,
-                                             iw & (kPackedBytes - 1)) -
-                                         x_zero_point);
-                      } else {
-                        input_tile[input_lane][local_ih][local_iw] = 0;
-                      }
-                    }
+                    const uint32_t global_word =
+                        aligned_global_word + stripe_word;
+                    input_stripe[stripe_row][stripe_word] =
+                        global_word < total_input_words ? x[global_word] : 0;
                   }
                 }
               }
             }
 
-          OutputSubBlockLoop:
-            for (int output_base = 0; output_base < kOutputBlock;
-                 output_base += kOutputParallel) {
-            ComputeOutputRowLoop:
-              for (int local_oh = 0; local_oh < kOutputTileHeight;
-                   ++local_oh) {
-              ComputeOutputColumnLoop:
-                for (int local_ow = 0; local_ow < kOutputTileWidth;
-                     ++local_ow) {
+          OutputTileWithinStripeLoop:
+            for (int stripe_ow_offset = 0;
+                 stripe_ow_offset < valid_stripe_ow;
+                 stripe_ow_offset += kOutputTileWidth) {
+              const int remaining_tile_ow =
+                  valid_stripe_ow - stripe_ow_offset;
+              const int valid_tile_ow = remaining_tile_ow < kOutputTileWidth
+                                            ? remaining_tile_ow
+                                            : kOutputTileWidth;
+              const int tile_patch_width =
+                  (valid_tile_ow - 1) * stride_w + 3;
+              const int tile_input_column_base =
+                  input_column_base + stripe_ow_offset * stride_w;
+
+            ExpandInputTileChannelLoop:
+              for (int input_lane = 0; input_lane < kInputParallel;
+                   ++input_lane) {
+                const int c = c_base + input_lane;
+              ExpandInputTileRowLoop:
+                for (int local_ih = 0; local_ih < kInputTileHeight;
+                     ++local_ih) {
+                ExpandInputTileWordLoop:
+                  for (int local_iw_base = 0;
+                       local_iw_base < kInputTileWidth;
+                       local_iw_base += kPackedBytes) {
 #pragma HLS PIPELINE II = 1
-#pragma HLS DEPENDENCE variable = accum inter false
-                ComputeOutputLaneLoop:
-                  for (int output_lane = 0;
-                       output_lane < kOutputParallel; ++output_lane) {
-#pragma HLS UNROLL
-                    const int local_m = output_base + output_lane;
-                    uint32_t packed_weights[kWeightWordsPerInputGroup];
-                    int32_t products[kInputParallel * 3 * 3];
-#pragma HLS ARRAY_PARTITION variable = packed_weights complete
-#pragma HLS ARRAY_PARTITION variable = products complete
-                  ReadPackedWeightWordLoop:
-                    for (int word = 0;
-                         word < kWeightWordsPerInputGroup; ++word) {
-#pragma HLS UNROLL
-                      packed_weights[word] =
-                          weight_cache[local_m]
-                                      [c_base / kInputParallel][word];
+                    const int ih = input_row_base + local_ih;
+                    const bool valid_row =
+                        c < c_size && local_ih < stripe_patch_height &&
+                        ih >= 0 && ih < h_size;
+                    const int group_first_iw =
+                        tile_input_column_base + local_iw_base;
+                    const int remaining_patch_columns =
+                        tile_patch_width - local_iw_base;
+                    const int active_group_bytes =
+                        remaining_patch_columns <= 0
+                            ? 0
+                            : (remaining_patch_columns < kPackedBytes
+                                      ? remaining_patch_columns
+                                      : kPackedBytes);
+                    const int group_last_iw =
+                        group_first_iw + active_group_bytes - 1;
+                    const int valid_first_iw =
+                        group_first_iw < 0 ? 0 : group_first_iw;
+                    const int valid_last_iw = group_last_iw >= input_w_size
+                                                  ? input_w_size - 1
+                                                  : group_last_iw;
+                    const bool has_valid_columns =
+                        active_group_bytes > 0 &&
+                        valid_first_iw <= valid_last_iw &&
+                        valid_first_iw < input_w_size && valid_last_iw >= 0;
+
+                    uint32_t row_byte_index = 0;
+                    uint32_t first_word = 0;
+                    uint32_t second_word = 0;
+                    uint32_t first_word_global_byte = 0;
+                    uint32_t second_word_global_byte = 0;
+                    if (valid_row && has_valid_columns) {
+                      row_byte_index =
+                          ((uint32_t)n * c_size + c) * h_size * input_w_size +
+                          (uint32_t)ih * input_w_size;
+                      const int stripe_valid_first_iw =
+                          input_column_base < 0 ? 0 : input_column_base;
+                      const uint32_t stripe_aligned_global_byte =
+                          (row_byte_index + stripe_valid_first_iw) &
+                          ~(uint32_t)(kAxiInputBytes - 1);
+                      first_word_global_byte =
+                          (row_byte_index + valid_first_iw) &
+                          ~(uint32_t)(kPackedBytes - 1);
+                      second_word_global_byte =
+                          (row_byte_index + valid_last_iw) &
+                          ~(uint32_t)(kPackedBytes - 1);
+                      const int first_word_index =
+                          (int)((first_word_global_byte -
+                                    stripe_aligned_global_byte) /
+                                kPackedBytes);
+                      const int second_word_index =
+                          (int)((second_word_global_byte -
+                                    stripe_aligned_global_byte) /
+                                kPackedBytes);
+                      const int stripe_row =
+                          input_lane * kInputTileHeight + local_ih;
+                      first_word = input_stripe[stripe_row][first_word_index];
+                      second_word = second_word_index == first_word_index
+                                        ? first_word
+                                        : input_stripe[stripe_row]
+                                                      [second_word_index];
                     }
-                  ProductInputLaneLoop:
-                    for (int input_lane = 0;
-                         input_lane < kInputParallel; ++input_lane) {
+
+                  ScatterInputByteLoop:
+                    for (int byte_lane = 0; byte_lane < kPackedBytes;
+                         ++byte_lane) {
 #pragma HLS UNROLL
-                    ProductRowLoop:
-                      for (int kh = 0; kh < 3; ++kh) {
-#pragma HLS UNROLL
-                      ProductColumnLoop:
-                        for (int kw = 0; kw < 3; ++kw) {
-#pragma HLS UNROLL
-                          const int product_index =
-                              (input_lane * 3 + kh) * 3 + kw;
-                          const int packed_word = product_index / kPackedBytes;
-                          const int packed_byte =
-                              product_index & (kPackedBytes - 1);
-                          const centered_t weight_value =
-                              m_block + local_m < m_size
-                                  ? (centered_t)((int32_t)unpackInt8(
-                                                     packed_weights[packed_word],
-                                                     packed_byte) -
-                                                 w_zero_point)
-                                  : centered_t(0);
-                          const int local_ih = local_oh * stride_h + kh;
-                          const int local_iw = local_ow * stride_w + kw;
-                          products[product_index] =
-                              dspMultiply(input_tile[input_lane][local_ih]
-                                                    [local_iw],
-                                  weight_value);
+                      const int local_iw = local_iw_base + byte_lane;
+                      const int iw = group_first_iw + byte_lane;
+                      if (local_iw < kInputTileWidth) {
+                        if (valid_row && local_iw < tile_patch_width &&
+                            iw >= 0 && iw < input_w_size) {
+                          const uint32_t word_global_byte =
+                              (row_byte_index + iw) &
+                              ~(uint32_t)(kPackedBytes - 1);
+                          const uint32_t packed_input =
+                              word_global_byte == first_word_global_byte
+                                  ? first_word
+                                  : second_word;
+                          input_tile[input_lane][local_ih][local_iw] =
+                              (centered_t)((int32_t)unpackInt8(
+                                               packed_input,
+                                               iw & (kPackedBytes - 1)) -
+                                           x_zero_point);
+                        } else {
+                          input_tile[input_lane][local_ih][local_iw] = 0;
                         }
                       }
                     }
-                    accum[local_m][local_oh][local_ow] +=
-                        reduce36(products);
+                  }
+                }
+              }
+
+            OutputSubBlockLoop:
+              for (int output_base = 0; output_base < active_output_span;
+                   output_base += kOutputParallel) {
+              ComputeOutputRowLoop:
+                for (int local_oh = 0; local_oh < kOutputTileHeight;
+                     ++local_oh) {
+                ComputeOutputColumnLoop:
+                  for (int local_ow = 0; local_ow < kOutputTileWidth;
+                       ++local_ow) {
+#pragma HLS PIPELINE II = 1
+#pragma HLS DEPENDENCE variable = accum inter false
+                    const int stripe_local_ow =
+                        stripe_ow_offset + local_ow;
+                  ComputeOutputLaneLoop:
+                    for (int output_lane = 0;
+                         output_lane < kOutputParallel; ++output_lane) {
+#pragma HLS UNROLL
+                      const int local_m = output_base + output_lane;
+                      uint32_t packed_weights[kWeightWordsPerInputGroup];
+                      int32_t products[kInputParallel * 3 * 3];
+#pragma HLS ARRAY_PARTITION variable = packed_weights complete
+#pragma HLS ARRAY_PARTITION variable = products complete
+                    ReadPackedWeightWordLoop:
+                      for (int word = 0;
+                           word < kWeightWordsPerInputGroup; ++word) {
+#pragma HLS UNROLL
+                        packed_weights[word] =
+                            weight_cache[local_m]
+                                        [c_base / kInputParallel][word];
+                      }
+                    ProductInputLaneLoop:
+                      for (int input_lane = 0;
+                           input_lane < kInputParallel; ++input_lane) {
+#pragma HLS UNROLL
+                      ProductRowLoop:
+                        for (int kh = 0; kh < 3; ++kh) {
+#pragma HLS UNROLL
+                        ProductColumnLoop:
+                          for (int kw = 0; kw < 3; ++kw) {
+#pragma HLS UNROLL
+                            const int product_index =
+                                (input_lane * 3 + kh) * 3 + kw;
+                            const int packed_word =
+                                product_index / kPackedBytes;
+                            const int packed_byte =
+                                product_index & (kPackedBytes - 1);
+                            const centered_t weight_value =
+                                m_block + local_m < m_size
+                                    ? (centered_t)((int32_t)unpackInt8(
+                                                       packed_weights
+                                                           [packed_word],
+                                                       packed_byte) -
+                                                   w_zero_point)
+                                    : centered_t(0);
+                            const int local_ih = local_oh * stride_h + kh;
+                            const int local_iw = local_ow * stride_w + kw;
+                            products[product_index] =
+                                dspMultiply(input_tile[input_lane][local_ih]
+                                                      [local_iw],
+                                    weight_value);
+                          }
+                        }
+                      }
+                      accum[local_m][local_oh][stripe_local_ow] +=
+                          reduce36(products);
+                    }
                   }
                 }
               }
@@ -383,7 +529,7 @@ OutputBlockLoop:
           }
 
         StoreOutputLoop:
-          for (int local_m = 0; local_m < kOutputBlock; ++local_m) {
+          for (int local_m = 0; local_m < active_output_count; ++local_m) {
             const int m = m_block + local_m;
           StoreOutputRowLoop:
             for (int local_oh = 0; local_oh < kOutputTileHeight; ++local_oh) {
@@ -391,7 +537,7 @@ OutputBlockLoop:
               int8_t output_bytes[kPackedBytes];
 #pragma HLS ARRAY_PARTITION variable = output_bytes complete
             StoreOutputColumnLoop:
-              for (int local_ow = 0; local_ow < kOutputTileWidth;
+              for (int local_ow = 0; local_ow < kOutputStripeWidth;
                    ++local_ow) {
 #pragma HLS PIPELINE II = 1
                 const int ow = ow_base + local_ow;
@@ -401,7 +547,7 @@ OutputBlockLoop:
                       accum[local_m][local_oh][local_ow],
                       bias_cache[local_m], requant_multiplier_bits,
                       output_zero_point);
-                  // ow_size and the eight-column tile are word aligned. Emit
+                  // ow_size and the 32-column stripe are word aligned. Emit
                   // one packed AXI word after four scalar requantizer cycles.
                   if (byte_lane == kPackedBytes - 1) {
                     const uint32_t output_byte_index =
